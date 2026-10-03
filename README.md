@@ -3,7 +3,7 @@
 A stdio MCP server that forwards every JSON-RPC message to a [Ramen](https://github.com/bkraad47/ramen)
 worker's `ramen.v1.Mcp/Call` over gRPC. It exists for MCP clients that can only start a local process
 (stdio) — Claude Desktop, Cursor, and the reference `mcp` SDK all speak Streamable HTTP directly against
-Ramen's edge and don't need it; see [local-quickstart](https://github.com/bkraad47/ramen/blob/main/docs/how-tos/local-quickstart.md)
+Ramen's edge and don't need it; see [Get started](https://bkraad47.github.io/ramen/get-started/)
 for that path instead.
 
 ## Install
