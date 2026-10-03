@@ -21,7 +21,11 @@ jobs:
         run: ./gen_proto.sh && git diff --exit-code -- src/ramen_proto
       - run: uv build
       - uses: actions/upload-artifact@v4
-        with: { name: dist, path: "dist/*.whl,dist/*.tar.gz" }
+        with:
+          name: dist
+          path: |  # one glob per line: upload-artifact does not split on commas (the v0.2.0 run uploaded nothing)
+            dist/*.whl
+            dist/*.tar.gz
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
