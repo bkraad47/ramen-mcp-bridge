@@ -1,0 +1,47 @@
+name: publish
+on:
+  push:
+    tags: ["v*"]
+permissions: { contents: write }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version matches the tag
+        run: |
+          TAG=${GITHUB_REF_NAME#v}
+          FILE=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          [ "$TAG" = "$FILE" ] || { echo "tag $TAG != pyproject.toml version $FILE"; exit 1; }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.14
+      - run: uv sync --group dev
+      - run: uv run pytest
+      - name: generated gRPC stubs match proto/ramen/v1/mcp.proto
+        run: ./gen_proto.sh && git diff --exit-code -- src/ramen_proto
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist/* }
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ramen-mcp-bridge v${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
+
+  # PyPI Trusted Publishing (OIDC): no stored API token. PyPI verifies this exact
+  # repo + workflow file + environment against the "pending publisher" configured
+  # on the PyPI project page — see the setup guide the agent handed you.
+  pypi-publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ramen-mcp-bridge
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
