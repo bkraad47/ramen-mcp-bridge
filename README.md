@@ -30,6 +30,26 @@ An older cluster still using the self-signed fallback needs its CA pulled once (
 get secret ramen-console-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > ramen-lb.pem`) and a `--ca
 ramen-lb.pem` flag.
 
+## Sign in as yourself (0.2.0)
+
+Instead of a shared `rmk_` group key, the bridge can sign **you** in through the console — with your password, a
+magic link, or the identity provider the console is configured with (Microsoft Entra ID, Google Workspace, any OIDC
+issuer). A super admin registers an OAuth client on the console's Config page with the redirect URI
+`http://127.0.0.1/callback` (any port) and gives you its client id; your account needs a role in the group (an
+*MCP User* is enough):
+
+```sh
+ramen-mcp-bridge --target <public-hostname>:443 --tls --oauth https://<public-hostname> --client-id <client id> \
+  --group demo --zone a
+```
+
+The first run opens your browser on the console's sign-in page (`--no-browser` prints the URL instead); after you
+approve, the refresh token is kept in `~/.config/ramen-mcp-bridge/tokens-*.json` (mode 0600, `--token-file` to move
+it) and later runs need no browser until it expires or is revoked. Access tokens are scoped to `mcp:<group>:<zone>`,
+refreshed before they expire and after the worker answers UNAUTHENTICATED; every call the worker logs then names
+your account (`user:<id>`), not a key. Environment: `RAMEN_BRIDGE_OAUTH`, `RAMEN_BRIDGE_CLIENT_ID`,
+`RAMEN_BRIDGE_TOKEN_FILE`.
+
 Point an MCP client at it directly:
 ```json
 {"mcpServers": {"ramen-stdio": {"command": "ramen-mcp-bridge",
