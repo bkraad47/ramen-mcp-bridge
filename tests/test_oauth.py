@@ -134,7 +134,8 @@ def test_login_exchanges_a_pkce_code_and_keeps_the_refresh_token(auth, tmp_path)
     assert q["resource"] == "mcp:demo:local" and len(q["state"]) >= 16
     saved = json.loads((tmp_path / "t.json").read_text())
     assert saved["refresh_token"] == "rt-1" and saved["expires_at"] > time.time()
-    assert oct(os.stat(tmp_path / "t.json").st_mode & 0o777) == "0o600"
+    if os.name == "posix":  # Windows has no mode bits; the file lives in the per-user %LOCALAPPDATA% instead
+        assert oct(os.stat(tmp_path / "t.json").st_mode & 0o777) == "0o600"
     assert c.bearer() == "good" and len(auth.authorizes) == 1 and len(auth.token_calls) == 1  # cached while fresh
 
 
@@ -227,3 +228,12 @@ def test_parse_args_oauth(monkeypatch, tmp_path):
     a = bridge.parse_args(["--target", "h:443", "--group", "g", "--zone", "z", "--no-browser"])
     assert a.oauth == "https://c2" and a.client_id == "env-cid" and a.token_file == str(tmp_path / "tok.json")
     assert a.no_browser is True
+
+
+def test_default_token_file_is_per_user_on_each_platform(monkeypatch, tmp_path):
+    monkeypatch.setattr(oauth.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert oauth.default_token_file("c", "i", "s").parent == tmp_path / "local" / "ramen-mcp-bridge"
+    monkeypatch.setattr(oauth.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert oauth.default_token_file("c", "i", "s").parent == tmp_path / "xdg" / "ramen-mcp-bridge"

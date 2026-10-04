@@ -1,5 +1,7 @@
 # ramen-mcp-bridge
 
+<!-- mcp-name: io.github.bkraad47/ramen-mcp-bridge -->
+
 A stdio MCP server that forwards every JSON-RPC message to a [Ramen](https://github.com/bkraad47/ramen)
 worker's `ramen.v1.Mcp/Call` over gRPC. It exists for MCP clients that can only start a local process
 (stdio) — Claude Desktop, Cursor, and the reference `mcp` SDK all speak Streamable HTTP directly against
@@ -44,7 +46,7 @@ ramen-mcp-bridge --target <public-hostname>:443 --tls --oauth https://<public-ho
 ```
 
 The first run opens your browser on the console's sign-in page (`--no-browser` prints the URL instead); after you
-approve, the refresh token is kept in `~/.config/ramen-mcp-bridge/tokens-*.json` (mode 0600, `--token-file` to move
+approve, the refresh token is kept in `~/.config/ramen-mcp-bridge/tokens-*.json` (mode 0600; `%LOCALAPPDATA%\ramen-mcp-bridge` on Windows; `--token-file` to move
 it) and later runs need no browser until it expires or is revoked. Access tokens are scoped to `mcp:<group>:<zone>`,
 refreshed before they expire and after the worker answers UNAUTHENTICATED; every call the worker logs then names
 your account (`user:<id>`), not a key. Environment: `RAMEN_BRIDGE_OAUTH`, `RAMEN_BRIDGE_CLIENT_ID`,

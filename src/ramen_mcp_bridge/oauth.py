@@ -40,7 +40,11 @@ def pkce() -> tuple[str, str]:
 
 def default_token_file(console: str, client_id: str, scope: str) -> Path:
     key = hashlib.sha256(f"{console}|{client_id}|{scope}".encode()).hexdigest()[:16]
-    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ramen-mcp-bridge"
+    if sys.platform == "win32":  # no mode bits on Windows; %LOCALAPPDATA% is per-user by ACL and never roams
+        root = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+    else:
+        root = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    base = Path(root) / "ramen-mcp-bridge"
     return base / f"tokens-{key}.json"
 
 
