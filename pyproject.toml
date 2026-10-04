@@ -1,6 +1,6 @@
 [project]
 name = "ramen-mcp-bridge"
-version = "0.2.1"
+version = "0.2.2"
 description = "Stdio MCP bridge for Project Ramen: forwards JSON-RPC to a ramen.v1.Mcp/Call worker over gRPC"
 readme = "README.md"
 requires-python = ">=3.10"
