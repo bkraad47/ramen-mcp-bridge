@@ -16,6 +16,7 @@ import http.server
 import json
 import os
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -77,11 +78,11 @@ class OAuthError(Exception):
     pass
 
 
-def _post_form(url: str, form: dict, timeout: float) -> dict:
+def _post_form(url: str, form: dict, timeout: float, context=None) -> dict:
     data = urllib.parse.urlencode(form).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         try:
@@ -104,19 +105,22 @@ class Client:
         timeout: float = 60.0,
         login_timeout: float = 300.0,
         listen: tuple[str, int] = ("127.0.0.1", 0),
+        ca: str | None = None,
     ):
         self.console, self.client_id, self.scope, self.store = console.rstrip("/"), client_id, scope, store
         self.opener = opener or webbrowser.open
         self.timeout, self.login_timeout, self.listen = timeout, login_timeout, listen
         self.tokens: dict | None = store.load()
         self._meta: dict | None = None
+        # `--ca` verifies the console as well as the worker: the AWS guide's console cert is self-signed
+        self.context = ssl.create_default_context(cafile=ca) if ca else None
 
     # --- discovery -----------------------------------------------------------------------------------------------
     def metadata(self) -> dict:
         if self._meta is None:
             url = f"{self.console}/.well-known/oauth-authorization-server"
             try:
-                with urllib.request.urlopen(url, timeout=self.timeout) as r:
+                with urllib.request.urlopen(url, timeout=self.timeout, context=self.context) as r:
                     self._meta = json.loads(r.read())
             except (urllib.error.URLError, ValueError) as e:
                 raise OAuthError(f"cannot read {url}: {e}") from e
@@ -184,6 +188,7 @@ class Client:
                     "code_verifier": verifier,
                 },
                 self.timeout,
+                self.context,
             )
         finally:
             srv.shutdown()
@@ -197,6 +202,7 @@ class Client:
             self.metadata()["token_endpoint"],
             {"grant_type": "refresh_token", "refresh_token": self.tokens["refresh_token"], "client_id": self.client_id},
             self.timeout,
+            self.context,
         )
         return self._keep(tokens)
 

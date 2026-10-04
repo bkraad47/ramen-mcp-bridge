@@ -237,3 +237,53 @@ def test_default_token_file_is_per_user_on_each_platform(monkeypatch, tmp_path):
     monkeypatch.setattr(oauth.sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     assert oauth.default_token_file("c", "i", "s").parent == tmp_path / "xdg" / "ramen-mcp-bridge"
+
+
+def test_ca_bundle_verifies_the_console_too(monkeypatch, tmp_path):
+    """Ramen 0.6.1 AWS run: `--ca` reached the gRPC channel only, so `--oauth` against a console with the self-signed
+    certificate the AWS guide makes failed with CERTIFICATE_VERIFY_FAILED on discovery."""
+    seen = []
+
+    class Resp:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(self.body).encode()
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen.append(context)
+        return Resp({"token_endpoint": "https://c/oauth/token", "access_token": "a", "expires_in": 60})
+
+    loaded = []
+    monkeypatch.setattr(oauth.ssl, "create_default_context", lambda cafile=None: loaded.append(cafile) or "ctx")
+    monkeypatch.setattr(oauth.urllib.request, "urlopen", fake_urlopen)
+    store = oauth.TokenFile(tmp_path / "t.json")
+    store.save({"refresh_token": "r", "expires_at": 0})
+    c = oauth.Client("https://c", "cid", "mcp:demo:a", store, ca="lb.pem")
+    c.refresh()
+    assert loaded == ["lb.pem"] and seen == ["ctx", "ctx"]  # discovery and the token call
+    seen.clear()
+    oauth.Client("https://c", "cid", "mcp:demo:a", store).metadata()
+    assert seen == [None]
+
+    made = {}
+
+    class NoSignIn:
+        def __init__(self, *a, **k):
+            made.update(k)
+
+        def bearer(self):
+            raise oauth.OAuthError("x")
+
+    monkeypatch.setattr(oauth, "Client", NoSignIn)
+    monkeypatch.setattr(bridge, "channel", lambda a: None)
+    args = ["--target", "t:443", "--ca", "lb.pem", "--oauth", "https://c", "--client-id", "cid", "--group", "g"]
+    assert bridge.main([*args, "--zone", "z"]) == 2
+    assert made.get("ca") == "lb.pem"

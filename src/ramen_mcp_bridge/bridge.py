@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     md = [(k, v) for k, v in (("ramen-group", a.group), ("ramen-zone", a.zone)) if v]
     if a.oauth:
         opener = (lambda url: None) if a.no_browser else None
-        client = oauth.Client(a.oauth, a.client_id, a.scope, oauth.TokenFile(a.token_file), opener=opener)
+        client = oauth.Client(a.oauth, a.client_id, a.scope, oauth.TokenFile(a.token_file), opener=opener, ca=a.ca)
         try:
             client.bearer()  # sign in before the first message, so the client's first request does not wait on a browser
         except oauth.OAuthError as e:
