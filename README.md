@@ -52,6 +52,13 @@ refreshed before they expire and after the worker answers UNAUTHENTICATED; every
 your account (`user:<id>`), not a key. Environment: `RAMEN_BRIDGE_OAUTH`, `RAMEN_BRIDGE_CLIENT_ID`,
 `RAMEN_BRIDGE_TOKEN_FILE`.
 
+**Expiry mid-task is invisible and safe.** When the access token runs out while a client is working, the worker
+answers UNAUTHENTICATED *before* the call reaches any tool code; the bridge refreshes the token and repeats that one
+call. A tool is never run twice by the bridge: a call that reached the runtime either returns a result or an error,
+and neither is retried. The browser only reappears when the refresh token itself has expired (thirty days unused) or
+was revoked because your role, password or account changed. The MCP session the client holds is bound to your
+account, not to the token, so it survives the refresh.
+
 Point an MCP client at it directly:
 ```json
 {"mcpServers": {"ramen-stdio": {"command": "ramen-mcp-bridge",
