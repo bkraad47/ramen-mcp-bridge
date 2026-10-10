@@ -301,14 +301,18 @@ def test_the_callback_page_closes_itself_after_a_successful_sign_in(auth, tmp_pa
     def browser(url):
         q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
         code = _json.loads(urllib.request.urlopen(url).read())["code"]
-        cb = q["redirect_uri"] + "?" + urllib.parse.urlencode({"state": q["state"], "code": code})
-        pages["ok"] = urllib.request.urlopen(cb).read().decode()
-        try:
+        try:  # a stray or forged callback before the real one is refused
             urllib.request.urlopen(q["redirect_uri"] + "?state=wrong")
         except urllib.error.HTTPError as e:
             pages["bad"] = e.read().decode()
+        cb = q["redirect_uri"] + "?" + urllib.parse.urlencode({"state": q["state"], "code": code})
+        pages["ok"] = urllib.request.urlopen(cb).read().decode()
+        # a reload right after success (or the fallback link) gets the same page, not a refused connection or a 400
+        pages["again"] = urllib.request.urlopen(cb).read().decode()
+        assert urllib.request.urlopen(q["redirect_uri"].rsplit("/", 1)[0] + "/favicon.ico").status == 204
 
     c = oauth.Client(auth.url, "cid", "mcp:demo:local", oauth.TokenFile(tmp_path / "t.json"), opener=browser)
     assert c.bearer() == "good"
     assert "window.close()" in pages["ok"] and "Signed in" in pages["ok"]
     assert "window.close()" not in pages["bad"] and "Sign-in failed" in pages["bad"]
+    assert "Signed in" in pages["again"]

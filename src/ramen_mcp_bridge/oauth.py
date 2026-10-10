@@ -136,9 +136,14 @@ class Client:
         class Callback(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+                if self.path.startswith("/favicon"):
+                    self.send_response(204)
+                    self.end_headers()
+                    return
                 ok = self.path.startswith("/callback") and q.get("state") == state and "code" in q
-                if ok:
+                if ok and "code" not in got:
                     got.update(q)
+                ok = ok or ("code" in got and self.path.startswith("/callback"))  # a reload after success
                 # 0.2.3: the tab closes itself once the code is in (browsers allow window.close() only for tabs a
                 # script opened — the bridge opened this one — so the text stays as the fallback).
                 body = (
@@ -198,6 +203,9 @@ class Client:
                 self.context,
             )
         finally:
+            # 0.2.3: keep answering for a moment — a browser that reloads, follows the fallback link or fetches the
+            # favicon right after the callback must get the "Signed in" page, not ERR_CONNECTION_REFUSED
+            threading.Event().wait(3.0)
             srv.shutdown()
             srv.server_close()
         return self._keep(tokens)
