@@ -387,3 +387,31 @@ def test_keychain_store_talks_to_the_os_secret_tool(tmp_path):
     assert s.load() == {"refresh_token": "rt"} and "-U" in calls[1] and "-s" in calls[1]
     s.clear()
     assert s.load() is None and calls[-2][1] == "delete-generic-password"
+
+
+def test_a_needed_sign_in_answers_the_call_with_error_32001_and_the_url(fake, capsys):  # noqa: F811
+    """D52: while serving, the bridge never hangs on a browser; the MCP call gets -32001 carrying the sign-in URL, on
+    the first try and after the worker refused a stale token; a notification gets no answer."""
+    url = "https://console.example/oauth/authorize?client_id=cid"
+    stub = mcp_pb2_grpc.McpStub(grpc.insecure_channel(fake.target))
+
+    def never(force=False):
+        raise oauth.SignInRequired(url)
+
+    out = json.loads(run(bridge.Bridge(stub, [], 5.0, bearer=never), b'{"jsonrpc":"2.0","id":7,"method":"ping"}\n'))
+    assert out["id"] == 7 and out["error"]["code"] == -32001
+    assert out["error"]["data"] == {"sign_in_url": url} and url in out["error"]["message"]
+    assert fake.seen == [], "no call reaches the worker without a token"
+    assert run(bridge.Bridge(stub, [], 5.0, bearer=never), b'{"jsonrpc":"2.0","method":"notifications/x"}\n') == b""
+
+    def stale_then_sign_in(force=False):
+        if force:
+            raise oauth.SignInRequired(url)
+        return "stale"
+
+    out = json.loads(
+        run(bridge.Bridge(stub, [], 5.0, bearer=stale_then_sign_in), b'{"jsonrpc":"2.0","id":8,"method":"ping"}\n')
+    )
+    assert out["error"]["code"] == -32001 and out["error"]["data"]["sign_in_url"] == url
+    assert [m.get("authorization") for m in fake.seen] == ["Bearer stale"]
+    assert "sign-in required" in capsys.readouterr().err
