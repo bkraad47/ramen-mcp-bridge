@@ -45,18 +45,26 @@ ramen-mcp-bridge --target <public-hostname>:443 --tls --oauth https://<public-ho
   --group demo --zone a
 ```
 
-The first run opens your browser on the console's sign-in page (`--no-browser` prints the URL instead); after you
-approve, the refresh token is kept in `~/.config/ramen-mcp-bridge/tokens-*.json` (mode 0600; `%LOCALAPPDATA%\ramen-mcp-bridge` on Windows; `--token-file` to move
-it) and later runs need no browser until it expires or is revoked. Access tokens are scoped to `mcp:<group>:<zone>`,
-refreshed before they expire and after the worker answers UNAUTHENTICATED; every call the worker logs then names
-your account (`user:<id>`), not a key. Environment: `RAMEN_BRIDGE_OAUTH`, `RAMEN_BRIDGE_CLIENT_ID`,
-`RAMEN_BRIDGE_TOKEN_FILE`.
+The first run opens your browser on the console's sign-in page (`--no-browser` prints the URL instead). Access
+tokens are scoped to `mcp:<group>:<zone>`, refreshed before they expire and after the worker answers
+UNAUTHENTICATED; every call the worker logs then names your account (`user:<id>`), not a key.
+
+**Where the tokens live (0.3.0).** In the bridge's memory, nowhere else, unless you ask: `--keychain` keeps them in the
+operating system's secret store (macOS Keychain through `security`, a Secret Service such as GNOME Keyring through
+`secret-tool`), behind its own access control; `--token-file <path>` keeps them in a plain file with mode 0600, meant
+for automation only. **Thirty minutes after the last call the bridge forgets its tokens** (`--idle-timeout`, seconds,
+`0` disables), and the next call needs a fresh sign-in. When a sign-in is needed while an MCP client is connected
+the bridge does not block: it starts the browser flow and answers the call with error `-32001` whose message carries
+the sign-in link (`data.sign_in_url` too), so an AI client can show it to you; once you approve, the next call goes
+through. Environment: `RAMEN_BRIDGE_OAUTH`, `RAMEN_BRIDGE_CLIENT_ID`, `RAMEN_BRIDGE_KEYCHAIN=1`,
+`RAMEN_BRIDGE_TOKEN_FILE`, `RAMEN_BRIDGE_IDLE_TIMEOUT`.
 
 **Expiry mid-task is invisible and safe.** When the access token runs out while a client is working, the worker
 answers UNAUTHENTICATED *before* the call reaches any tool code; the bridge refreshes the token and repeats that one
 call. A tool is never run twice by the bridge: a call that reached the runtime either returns a result or an error,
-and neither is retried. The browser only reappears when the refresh token itself has expired (thirty days unused) or
-was revoked because your role, password or account changed. The MCP session the client holds is bound to your
+and neither is retried. The browser only reappears when the bridge has forgotten its tokens (thirty minutes idle, or
+a new bridge process without `--keychain`/`--token-file`), when the refresh token itself has expired on the console
+(thirty days unused), or when it was revoked because your role, password or account changed. The MCP session the client holds is bound to your
 account, not to the token, so it survives the refresh.
 
 Point an MCP client at it directly:

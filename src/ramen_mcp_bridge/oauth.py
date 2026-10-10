@@ -74,8 +74,83 @@ class TokenFile:
             pass
 
 
+class MemoryStore:
+    """0.3.0 default: tokens live in this process only. Nothing touches the disk; a new bridge signs in again."""
+
+    def load(self) -> dict | None:
+        return None
+
+    def save(self, tokens: dict) -> None:
+        pass
+
+    def clear(self) -> None:
+        pass
+
+
+class KeychainStore:
+    """0.3.0 `--keychain`: the tokens live in the operating system's secret store, behind its own access control —
+    macOS Keychain through `security`, a Secret Service (GNOME Keyring, KWallet) through `secret-tool`. Nothing is
+    written as a file. `available()` says whether this machine has one."""
+
+    SERVICE = "ramen-mcp-bridge"
+
+    def __init__(self, account: str, runner: Callable[..., object] | None = None):
+        import shutil
+        import subprocess
+
+        self.account = account
+        self.tool = next((t for t in ("security", "secret-tool") if shutil.which(t)), None)
+        self._run = runner or (lambda cmd, **kw: subprocess.run(cmd, capture_output=True, text=True, check=False, **kw))
+
+    @classmethod
+    def available(cls) -> bool:
+        import shutil
+
+        return any(shutil.which(t) for t in ("security", "secret-tool"))
+
+    def _cmd(self, op: str) -> list[str]:
+        if self.tool == "security":
+            base = {"load": "find-generic-password", "save": "add-generic-password", "clear": "delete-generic-password"}
+            cmd = ["security", base[op], "-a", self.account, "-s", self.SERVICE]
+            return cmd + (["-w"] if op == "load" else ["-U"] if op == "save" else [])
+        base = {"load": "lookup", "save": "store", "clear": "clear"}
+        cmd = ["secret-tool", base[op]] + (["--label", self.SERVICE] if op == "save" else [])
+        return cmd + ["service", self.SERVICE, "account", self.account]
+
+    def load(self) -> dict | None:
+        if not self.tool:
+            return None
+        r = self._run(self._cmd("load"))
+        try:
+            return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None  # type: ignore[union-attr]
+        except ValueError:
+            return None
+
+    def save(self, tokens: dict) -> None:
+        if not self.tool:
+            raise OAuthError("no keychain tool on this machine (security / secret-tool)")
+        raw = json.dumps(tokens)
+        if self.tool == "security":
+            self._run(self._cmd("save") + ["-w", raw])
+        else:
+            self._run(self._cmd("save"), input=raw)
+
+    def clear(self) -> None:
+        if self.tool:
+            self._run(self._cmd("clear"))
+
+
 class OAuthError(Exception):
     pass
+
+
+class SignInRequired(OAuthError):
+    """0.3.0: a call arrived while no valid token is held. The browser flow has been started; `url` is where the
+    person signs in. The bridge turns this into a JSON-RPC error the AI client can read out to the person."""
+
+    def __init__(self, url: str):
+        super().__init__(f"sign in to Ramen first: open {url} and approve, then retry")
+        self.url = url
 
 
 def _post_form(url: str, form: dict, timeout: float, context=None) -> dict:
@@ -100,17 +175,28 @@ class Client:
         console: str,
         client_id: str,
         scope: str,
-        store: TokenFile,
+        store: TokenFile | MemoryStore | KeychainStore | None = None,
         opener: Callable[[str], object] | None = None,
         timeout: float = 60.0,
         login_timeout: float = 300.0,
         listen: tuple[str, int] = ("127.0.0.1", 0),
         ca: str | None = None,
+        idle_secs: float = 1800.0,
     ):
-        self.console, self.client_id, self.scope, self.store = console.rstrip("/"), client_id, scope, store
+        """`store` (0.3.0): where tokens rest — `MemoryStore` (default, nothing on disk), `KeychainStore` (the OS
+        secret store) or `TokenFile` (a plain 0600 file; opt-in, for automation). `idle_secs`: tokens are forgotten
+        this long after the last call (default thirty minutes; 0 keeps them for the console's own lifetimes), and the
+        next call needs a fresh sign-in."""
+        self.console, self.client_id, self.scope = console.rstrip("/"), client_id, scope
+        self.store = store if store is not None else MemoryStore()
         self.opener = opener or webbrowser.open
         self.timeout, self.login_timeout, self.listen = timeout, login_timeout, listen
-        self.tokens: dict | None = store.load()
+        self.idle_secs = idle_secs
+        self.last_used = time.time()
+        self.pending_url: str | None = None
+        self._login_thread: threading.Thread | None = None
+        self._login_error: Exception | None = None
+        self.tokens: dict | None = self.store.load()
         self._meta: dict | None = None
         # `--ca` verifies the console as well as the worker: the AWS guide's console cert is self-signed
         self.context = ssl.create_default_context(cafile=ca) if ca else None
@@ -184,6 +270,7 @@ class Client:
                 "resource": self.scope,
             }
             url = self.metadata()["authorization_endpoint"] + "?" + urllib.parse.urlencode(params)
+            self.pending_url = url
             print(f"ramen-mcp-bridge: sign in at {url}", file=sys.stderr)
             self.opener(url)
             if not done.wait(self.login_timeout):
@@ -229,16 +316,58 @@ class Client:
         return tokens
 
     # --- what the bridge asks for --------------------------------------------------------------------------------
-    def bearer(self, force: bool = False) -> str:
-        """A valid access token: cached while fresh, refreshed when near its end (or on `force`), else a new sign-in."""
+    def forget(self, why: str = "") -> None:
+        """Drop every token, here and in the store; the next call signs in again."""
+        if self.tokens is not None and why:
+            print(f"ramen-mcp-bridge: {why}; signing in again", file=sys.stderr)
+        self.store.clear()
+        self.tokens = None
+
+    def bearer(self, force: bool = False, nonblocking: bool = False) -> str:
+        """A valid access token: cached while fresh, refreshed when near its end (or on `force`), else a new sign-in.
+        Idle tokens (no call for `idle_secs`) are forgotten first. With `nonblocking` (what the bridge uses while it
+        serves an MCP client) a needed sign-in is started in the background and `SignInRequired` carries its URL, so
+        the client is told instead of left hanging; the call succeeds once the person has approved."""
+        now = time.time()
+        if self.tokens and self.idle_secs and now - self.last_used > self.idle_secs:
+            self.forget(f"no call for {int(self.idle_secs)} s, tokens forgotten")
+        self.last_used = now
         t = self.tokens or {}
-        if not force and t.get("access_token") and t.get("expires_at", 0) - EARLY > time.time():
+        if not force and t.get("access_token") and t.get("expires_at", 0) - EARLY > now:
             return t["access_token"]
         if t.get("refresh_token"):
             try:
                 return self.refresh()["access_token"]
             except OAuthError as e:
-                print(f"ramen-mcp-bridge: refresh failed ({e}); signing in again", file=sys.stderr)
-                self.store.clear()
-                self.tokens = None
-        return self.login()["access_token"]
+                self.forget(f"refresh failed ({e})")
+        if not nonblocking:
+            return self.login()["access_token"]
+        return self._login_in_background()
+
+    def _login_in_background(self) -> str:
+        th = self._login_thread
+        if th is not None and not th.is_alive():  # a previous attempt ended: with tokens, or with an error
+            self._login_thread = None
+            if self._login_error is not None:
+                err, self._login_error = self._login_error, None
+                raise err
+            if self.tokens and self.tokens.get("access_token"):
+                return self.tokens["access_token"]
+        if self._login_thread is None:
+            self.pending_url = None
+
+            def run():
+                try:
+                    self.login()
+                except OAuthError as e:
+                    self._login_error = e
+
+            self._login_thread = threading.Thread(target=run, daemon=True)
+            self._login_thread.start()
+            for _ in range(50):  # the URL is known as soon as login() reaches the opener
+                if self.pending_url or not self._login_thread.is_alive():
+                    break
+                time.sleep(0.1)
+        if self.pending_url:
+            raise SignInRequired(self.pending_url)
+        raise OAuthError("sign-in could not be started")
