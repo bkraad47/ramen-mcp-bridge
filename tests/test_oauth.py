@@ -287,3 +287,28 @@ def test_ca_bundle_verifies_the_console_too(monkeypatch, tmp_path):
     args = ["--target", "t:443", "--ca", "lb.pem", "--oauth", "https://c", "--client-id", "cid", "--group", "g"]
     assert bridge.main([*args, "--zone", "z"]) == 2
     assert made.get("ca") == "lb.pem"
+
+
+def test_the_callback_page_closes_itself_after_a_successful_sign_in(auth, tmp_path):
+    """0.2.3: the loopback page a browser lands on after consent closes its own tab; a refused callback does not."""
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    pages = {}
+
+    def browser(url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        code = _json.loads(urllib.request.urlopen(url).read())["code"]
+        cb = q["redirect_uri"] + "?" + urllib.parse.urlencode({"state": q["state"], "code": code})
+        pages["ok"] = urllib.request.urlopen(cb).read().decode()
+        try:
+            urllib.request.urlopen(q["redirect_uri"] + "?state=wrong")
+        except urllib.error.HTTPError as e:
+            pages["bad"] = e.read().decode()
+
+    c = oauth.Client(auth.url, "cid", "mcp:demo:local", oauth.TokenFile(tmp_path / "t.json"), opener=browser)
+    assert c.bearer() == "good"
+    assert "window.close()" in pages["ok"] and "Signed in" in pages["ok"]
+    assert "window.close()" not in pages["bad"] and "Sign-in failed" in pages["bad"]

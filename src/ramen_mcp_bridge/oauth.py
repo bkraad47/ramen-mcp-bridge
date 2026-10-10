@@ -139,10 +139,17 @@ class Client:
                 ok = self.path.startswith("/callback") and q.get("state") == state and "code" in q
                 if ok:
                     got.update(q)
+                # 0.2.3: the tab closes itself once the code is in (browsers allow window.close() only for tabs a
+                # script opened — the bridge opened this one — so the text stays as the fallback).
                 body = (
                     b"<html><body style='font-family:sans-serif'><h2>ramen-mcp-bridge</h2><p>"
-                    + (b"Signed in. You can close this tab." if ok else b"Sign-in failed: " + json.dumps(q).encode())
-                    + b"</p></body></html>"
+                    + (
+                        b"Signed in. This tab closes by itself; close it if it does not."
+                        b"</p><script>setTimeout(function(){window.close()},800)</script>"
+                        if ok
+                        else b"Sign-in failed: " + json.dumps(q).encode() + b"</p>"
+                    )
+                    + b"</body></html>"
                 )
                 self.send_response(200 if ok else 400)
                 self.send_header("Content-Type", "text/html")
