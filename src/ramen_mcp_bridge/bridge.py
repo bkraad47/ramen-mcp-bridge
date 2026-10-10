@@ -64,7 +64,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="OAuth client id a super admin registered (RAMEN_BRIDGE_CLIENT_ID)",
     )
     ap.add_argument(
-        "--token-file", default=_env("TOKEN_FILE"), help="where the refresh token is kept (RAMEN_BRIDGE_TOKEN_FILE)"
+        "--token-file",
+        default=_env("TOKEN_FILE"),
+        help="keep the tokens in this plain 0600 file (automation only; by default nothing is written to disk) "
+        "(RAMEN_BRIDGE_TOKEN_FILE)",
+    )
+    ap.add_argument(
+        "--keychain",
+        action="store_true",
+        default=_env("KEYCHAIN") == "1",
+        help="keep the tokens in the operating system's secret store (macOS Keychain / Secret Service) "
+        "(RAMEN_BRIDGE_KEYCHAIN=1)",
+    )
+    ap.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=float(_env("IDLE_TIMEOUT") or 1800),
+        help="forget the tokens this many seconds after the last call; the next call needs a fresh sign-in "
+        "(default 1800 = 30 minutes; 0 disables) (RAMEN_BRIDGE_IDLE_TIMEOUT)",
     )
     ap.add_argument("--no-browser", action="store_true", help="print the sign-in URL instead of opening a browser")
     a = ap.parse_args(argv)
@@ -79,7 +96,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if not (a.group and a.zone):
             ap.error("--oauth needs --group and --zone: the token is scoped to mcp:<group>:<zone>")
         a.scope = f"mcp:{a.group}:{a.zone}"
-        a.token_file = a.token_file or str(oauth.default_token_file(a.oauth, a.client_id, a.scope))
+        if a.keychain and a.token_file:
+            ap.error("--keychain and --token-file exclude each other")
+        if a.keychain and not oauth.KeychainStore.available():
+            ap.error("--keychain: no `security` (macOS) or `secret-tool` (Secret Service) on this machine")
     elif a.health is None and not a.key:
         ap.error("--key (or RAMEN_BRIDGE_KEY / RAMEN_MCP_KEY) or --oauth is required")
     a.use_tls = bool(a.tls or a.ca) and not a.insecure
@@ -127,13 +147,33 @@ class Bridge:
     def forward(self, raw: bytes) -> bytes | None:
         try:
             return self._call(raw, self._metadata())
+        except oauth.SignInRequired as e:  # 0.3.0: tell the client (and through it the person) where to sign in
+            return self.sign_in_error(raw, e)
         except grpc.RpcError as e:
             if self.bearer is not None and e.code() == grpc.StatusCode.UNAUTHENTICATED:
                 try:
                     return self._call(raw, self._metadata(force=True))
+                except oauth.SignInRequired as again:
+                    return self.sign_in_error(raw, again)
                 except grpc.RpcError as again:
                     return self.error_for(raw, again)
             return self.error_for(raw, e)
+
+    @staticmethod
+    def sign_in_error(raw: bytes, e: "oauth.SignInRequired") -> bytes | None:
+        print(json.dumps({"level": "warn", "msg": "sign-in required", "url": e.url}), file=sys.stderr)
+        try:
+            rid = json.loads(raw).get("id")
+        except (ValueError, AttributeError):
+            rid = None
+        if rid is None:
+            return None
+        msg = (
+            "Ramen sign-in required. Ask the person to open this link in a browser and approve, then retry the call: "
+            f"{e.url}"
+        )
+        err = {"code": -32001, "message": msg, "data": {"sign_in_url": e.url}}
+        return json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}).encode()
 
     def _call(self, raw: bytes, md) -> bytes | None:
         return self.stub.Call(mcp_pb2.JsonRpc(body=raw), metadata=md, timeout=self.timeout).body or None
@@ -179,14 +219,28 @@ def main(argv: list[str] | None = None) -> int:
     md = [(k, v) for k, v in (("ramen-group", a.group), ("ramen-zone", a.zone)) if v]
     if a.oauth:
         opener = (lambda url: None) if a.no_browser else None
-        client = oauth.Client(a.oauth, a.client_id, a.scope, oauth.TokenFile(a.token_file), opener=opener, ca=a.ca)
+        # 0.3.0: memory by default (nothing on disk); --keychain → the OS secret store; --token-file → a plain file
+        if a.keychain:
+            store = oauth.KeychainStore(f"{a.oauth}|{a.client_id}|{a.scope}")
+        elif a.token_file:
+            store = oauth.TokenFile(a.token_file)
+        else:
+            store = oauth.MemoryStore()
+        client = oauth.Client(
+            a.oauth, a.client_id, a.scope, store, opener=opener, ca=a.ca, idle_secs=max(0.0, a.idle_timeout)
+        )
         try:
             client.bearer()  # sign in before the first message, so the client's first request does not wait on a browser
         except oauth.OAuthError as e:
             print(f"ramen-mcp-bridge: {e}", file=sys.stderr)
             return 2
+        # while serving, a needed sign-in is reported to the client as an error carrying the URL, never a hang
+
+        def bearer(force: bool = False) -> str:
+            return client.bearer(force=force, nonblocking=True)
+
         return serve(
-            Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout, bearer=client.bearer), sys.stdin.buffer, sys.stdout.buffer
+            Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout, bearer=bearer), sys.stdin.buffer, sys.stdout.buffer
         )
     md = [("authorization", f"Bearer {a.key}"), *md]
     return serve(Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout), sys.stdin.buffer, sys.stdout.buffer)
