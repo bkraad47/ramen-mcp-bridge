@@ -217,7 +217,7 @@ def test_parse_args_oauth(monkeypatch, tmp_path):
         ]
     )
     assert a.oauth == "https://console" and a.client_id == "cid" and a.key is None
-    assert a.token_file == str(oauth.default_token_file("https://console", "cid", "mcp:demo:a"))
+    assert a.token_file is None and not a.keychain and a.idle_timeout == 1800  # 0.3.0: memory unless asked
     with pytest.raises(SystemExit):
         bridge.parse_args(["--target", "h:443", "--oauth", "https://console"])  # needs a client id
     with pytest.raises(SystemExit):
@@ -287,3 +287,131 @@ def test_ca_bundle_verifies_the_console_too(monkeypatch, tmp_path):
     args = ["--target", "t:443", "--ca", "lb.pem", "--oauth", "https://c", "--client-id", "cid", "--group", "g"]
     assert bridge.main([*args, "--zone", "z"]) == 2
     assert made.get("ca") == "lb.pem"
+
+
+def test_the_callback_page_closes_itself_after_a_successful_sign_in(auth, tmp_path):
+    """0.2.3: the loopback page a browser lands on after consent closes its own tab; a refused callback does not."""
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    pages = {}
+
+    def browser(url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        code = _json.loads(urllib.request.urlopen(url).read())["code"]
+        try:  # a stray or forged callback before the real one is refused
+            urllib.request.urlopen(q["redirect_uri"] + "?state=wrong")
+        except urllib.error.HTTPError as e:
+            pages["bad"] = e.read().decode()
+        cb = q["redirect_uri"] + "?" + urllib.parse.urlencode({"state": q["state"], "code": code})
+        pages["ok"] = urllib.request.urlopen(cb).read().decode()
+        # a reload right after success (or the fallback link) gets the same page, not a refused connection or a 400
+        pages["again"] = urllib.request.urlopen(cb).read().decode()
+        assert urllib.request.urlopen(q["redirect_uri"].rsplit("/", 1)[0] + "/favicon.ico").status == 204
+
+    c = oauth.Client(auth.url, "cid", "mcp:demo:local", oauth.TokenFile(tmp_path / "t.json"), opener=browser)
+    assert c.bearer() == "good"
+    assert "window.close()" in pages["ok"] and "Signed in" in pages["ok"]
+    assert "window.close()" not in pages["bad"] and "Sign-in failed" in pages["bad"]
+    assert "Signed in" in pages["again"]
+
+
+def test_memory_store_is_the_default_and_writes_nothing(auth, tmp_path, monkeypatch):
+    """0.3.0: tokens rest in the process only unless a store is chosen."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    c = oauth.Client(auth.url, "cid", "mcp:demo:local", opener=auth.browser)
+    assert c.bearer() == "good" and isinstance(c.store, oauth.MemoryStore)
+    assert not list(tmp_path.rglob("*.json"))
+    c2 = oauth.Client(auth.url, "cid", "mcp:demo:local", opener=auth.browser)
+    assert c2.tokens is None and c2.bearer() == "good" and len(auth.authorizes) == 2  # a new process signs in again
+
+
+def test_idle_tokens_are_forgotten_and_the_next_call_signs_in_again(auth, tmp_path):
+    store = oauth.TokenFile(tmp_path / "t.json")
+    c = oauth.Client(auth.url, "cid", "mcp:demo:local", store, opener=auth.browser, idle_secs=1.0)
+    assert c.bearer() == "good" and (tmp_path / "t.json").exists()
+    c.last_used -= 2  # thirty minutes in the real default; one second here
+    assert c.bearer() == "good"
+    assert len(auth.authorizes) == 2 and auth.token_calls[-1]["grant_type"] == "authorization_code"  # not a refresh
+    c.idle_secs = 0  # disabled: the refresh token keeps working
+    c.last_used -= 10
+    assert c.bearer() == "good" and len(auth.authorizes) == 2
+
+
+def test_nonblocking_sign_in_reports_the_url_then_succeeds(auth, tmp_path):
+    """0.3.0: while serving an MCP client the bridge never blocks on a browser; the first call answers with the URL."""
+    import time as _time
+
+    opened: list[str] = []
+    c = oauth.Client(auth.url, "cid", "mcp:demo:local", opener=opened.append, idle_secs=0)
+    with pytest.raises(oauth.SignInRequired) as info:
+        c.bearer(nonblocking=True)
+    url = info.value.url
+    assert url.startswith(auth.url + "/oauth/authorize?") and "retry" in str(info.value)
+    with pytest.raises(oauth.SignInRequired) as again:  # asked again before the person approved: the same URL
+        c.bearer(nonblocking=True)
+    assert again.value.url == url and opened == [url]
+    auth.browser(url)  # the person approves in the browser
+    for _ in range(50):
+        _time.sleep(0.1)
+        if c.tokens:
+            break
+    assert c.bearer(nonblocking=True) == "good"
+
+
+def test_keychain_store_talks_to_the_os_secret_tool(tmp_path):
+    """0.3.0 `--keychain`: `security` on macOS, `secret-tool` elsewhere; the fake records the calls."""
+    calls: list[list[str]] = []
+    vault: dict[str, str] = {}
+
+    class R:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout = rc, out
+
+    def runner(cmd, **kw):
+        calls.append(cmd)
+        if cmd[1] == "find-generic-password":
+            return R(0, vault.get("v", "")) if "v" in vault else R(44)
+        if cmd[1] == "add-generic-password":
+            vault["v"] = cmd[-1]
+            return R(0)
+        vault.pop("v", None)
+        return R(0)
+
+    s = oauth.KeychainStore("acct", runner=runner)
+    s.tool = "security"
+    assert s.load() is None
+    s.save({"refresh_token": "rt"})
+    assert s.load() == {"refresh_token": "rt"} and "-U" in calls[1] and "-s" in calls[1]
+    s.clear()
+    assert s.load() is None and calls[-2][1] == "delete-generic-password"
+
+
+def test_a_needed_sign_in_answers_the_call_with_error_32001_and_the_url(fake, capsys):  # noqa: F811
+    """D52: while serving, the bridge never hangs on a browser; the MCP call gets -32001 carrying the sign-in URL, on
+    the first try and after the worker refused a stale token; a notification gets no answer."""
+    url = "https://console.example/oauth/authorize?client_id=cid"
+    stub = mcp_pb2_grpc.McpStub(grpc.insecure_channel(fake.target))
+
+    def never(force=False):
+        raise oauth.SignInRequired(url)
+
+    out = json.loads(run(bridge.Bridge(stub, [], 5.0, bearer=never), b'{"jsonrpc":"2.0","id":7,"method":"ping"}\n'))
+    assert out["id"] == 7 and out["error"]["code"] == -32001
+    assert out["error"]["data"] == {"sign_in_url": url} and url in out["error"]["message"]
+    assert fake.seen == [], "no call reaches the worker without a token"
+    assert run(bridge.Bridge(stub, [], 5.0, bearer=never), b'{"jsonrpc":"2.0","method":"notifications/x"}\n') == b""
+
+    def stale_then_sign_in(force=False):
+        if force:
+            raise oauth.SignInRequired(url)
+        return "stale"
+
+    out = json.loads(
+        run(bridge.Bridge(stub, [], 5.0, bearer=stale_then_sign_in), b'{"jsonrpc":"2.0","id":8,"method":"ping"}\n')
+    )
+    assert out["error"]["code"] == -32001 and out["error"]["data"]["sign_in_url"] == url
+    assert [m.get("authorization") for m in fake.seen] == ["Bearer stale"]
+    assert "sign-in required" in capsys.readouterr().err
