@@ -22,8 +22,13 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
 
     def __init__(self):
         self.seen: list[dict] = []
+        self.hook = None  # 0.4.0 tests: (msg, md) -> error dict | None, a gate in front of the methods
+        self.next_cursor: str | None = None
+        self.delay = 0.0
 
     def Call(self, request, context):
+        import time
+
         md = dict(context.invocation_metadata())
         self.seen.append(md)
         if md.get("authorization") != "Bearer good":
@@ -35,9 +40,11 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
         if method == "busy":
             context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "busy")
         if method == "slow":
-            import time
-
             time.sleep(2)
+        if self.delay:
+            time.sleep(self.delay)
+        if self.hook and (err := self.hook(msg, md)):
+            return mcp_pb2.JsonRpc(body=json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}).encode())
         result = {
             "ping": {},
             "initialize": {
@@ -59,6 +66,10 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
                 ]
             },
         }.get(method)
+        if method == "tools/list" and self.next_cursor:
+            result["nextCursor"] = self.next_cursor
+        if method in ("prompts/get", "resources/read"):
+            result = {"messages": []} if method == "prompts/get" else {"contents": []}
         if method == "tools/call":
             args = msg["params"]["arguments"]
             result = {"content": [{"type": "text", "text": str(args["a"] + args["b"])}], "isError": False}
@@ -237,7 +248,8 @@ def test_mcp_sdk_stdio_client_through_the_bridge(fake):
             await s.initialize()
             tools = await s.list_tools()
             res = await s.call_tool("add", {"a": 2, "b": 3})
-            return [t.name for t in tools.tools], res.content[0].text, res.is_error
+            rep = await s.call_tool("ramen_report", {"kind": "llm", "name": "m", "ms": 3, "ok": True, "reasoning": "r"})
+            return [t.name for t in tools.tools], res.content[0].text, res.is_error, rep.is_error
 
-    assert asyncio.run(go()) == (["add"], "5", False)
+    assert asyncio.run(go()) == (["add", "ramen_report"], "5", False, False)
     assert any(m.get("ramen-group") == "demo" for m in fake.seen)
