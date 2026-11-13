@@ -26,6 +26,7 @@ class FakeAS:
     def __init__(self, access="good"):
         self.access, self.codes, self.refreshes, self.authorizes, self.token_calls = access, {}, set(), [], []
         self.dead_refresh = False
+        self.telemetry: dict | None = None  # 0.4.0: the `telemetry` object a token answer carries (§24.3/§26.3)
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -85,16 +86,16 @@ class FakeAS:
                     return self._json(400, {"error": "unsupported_grant_type", "error_description": "no"})
                 rt = f"rt-{len(outer.token_calls)}"
                 outer.refreshes.add(rt)
-                return self._json(
-                    200,
-                    {
-                        "access_token": outer.access,
-                        "token_type": "Bearer",
-                        "expires_in": 3600,
-                        "refresh_token": rt,
-                        "scope": "mcp:demo:local",
-                    },
-                )
+                answer = {
+                    "access_token": outer.access,
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "refresh_token": rt,
+                    "scope": "mcp:demo:local",
+                }
+                if outer.telemetry is not None:
+                    answer["telemetry"] = outer.telemetry
+                return self._json(200, answer)
 
             def log_message(self, *_):
                 pass

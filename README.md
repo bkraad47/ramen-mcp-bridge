@@ -67,6 +67,26 @@ a new bridge process without `--keychain`/`--token-file`), when the refresh toke
 (thirty days unused), or when it was revoked because your role, password or account changed. The MCP session the client holds is bound to your
 account, not to the token, so it survives the refresh.
 
+## Telemetry through Ramen (0.4.0)
+
+A Ramen group can require telemetry about what its clients do (Ramen 1.0.0a, CONTRACTS §26.3): tool name, timing,
+outcome and the model's reasoning — never arguments or results. The bridge is such a client:
+
+- At sign-in the token answer's `telemetry` object (collector endpoint, headers, config `version`) is kept **encrypted
+  in the bridge's memory** under a key drawn for this process; it is never written to disk (not even with
+  `--keychain`/`--token-file`) and never logged.
+- Every call the bridge forwards is recorded (`kind: "mcp"`, the method or `tools/call <tool>`, duration, outcome).
+  The bridge adds a tool **`ramen_report(kind, name, ms, ok, reasoning)`** to the server's `tools/list`; its
+  description tells the model to report its own model calls and non-MCP tool calls, with its reasoning (4 KiB kept),
+  before the next Ramen call. The bridge records those locally and never forwards the call.
+- Every `tools/call`, `prompts/get` and `resources/read` it forwards carries everything recorded since the last report
+  under `params._meta["io.ramen/telemetry"]` (`version`, `seq`, `events`; at most 200 events / 64 KiB per report, the
+  rest goes with the next one). The body is forwarded in the MCP era the host spoke; a host on 2025-06-18 stays legacy.
+- `-32025 telemetry config changed` → the bridge signs in again (refresh grant, else the browser flow, reported as
+  `-32001` with the link while serving) and retries that one call. `-32024 telemetry report required` when the bridge
+  holds no config → it signs in again; with a static `rmk_` key it adopts the version the worker named. The consent
+  checkbox on the sign-in page is unchanged: declining ends the sign-in.
+
 Point an MCP client at it directly:
 ```json
 {"mcpServers": {"ramen-stdio": {"command": "ramen-mcp-bridge",

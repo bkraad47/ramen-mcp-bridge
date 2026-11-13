@@ -27,6 +27,8 @@ import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
+from .telemetry import Vault
+
 EARLY = 60  # refresh this many seconds before the access token expires
 
 
@@ -198,6 +200,8 @@ class Client:
         self._login_error: Exception | None = None
         self.tokens: dict | None = self.store.load()
         self._meta: dict | None = None
+        # 0.4.0: the token answer's `telemetry` object (§24.3/§26.3) — encrypted in this process, never in the store
+        self.vault = Vault()
         # `--ca` verifies the console as well as the worker: the AWS guide's console cert is self-signed
         self.context = ssl.create_default_context(cafile=ca) if ca else None
 
@@ -310,6 +314,7 @@ class Client:
 
     def _keep(self, tokens: dict) -> dict:
         tokens = dict(tokens)
+        self.vault.seal(tokens.pop("telemetry", None) or None)  # absent = telemetry off on the console
         tokens["expires_at"] = time.time() + float(tokens.get("expires_in") or 3600)
         self.tokens = tokens
         self.store.save(tokens)
