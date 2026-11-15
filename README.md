@@ -87,6 +87,51 @@ outcome and the model's reasoning — never arguments or results. The bridge is 
   holds no config → it signs in again; with a static `rmk_` key it adopts the version the worker named. The consent
   checkbox on the sign-in page is unchanged: declining ends the sign-in.
 
+## The policy bundle and your editors (0.5.0)
+
+A Ramen group's **policy** for its clients is what the token answer carries at sign-in: the `telemetry` object above
+and, when the group repo has `mcp/evals/promptfooconfig.yaml`, an `evals` object (`version`, `required`, and the
+config text) — Ramen 1.0.0c, CONTRACTS §29.3. The bridge keeps and enforces it:
+
+- **Bundle on disk.** `~/.ramen/policy/<host>/<group>-<zone>.json` (mode 0600, directories 0700) holds `telemetry`
+  (without the collector headers, which stay in memory only) and `evals` (`version`, `required`), plus the target,
+  group, zone and console it belongs to; the evals config text goes to
+  `~/.ramen/evals/<host>/<group>/promptfooconfig.yaml`. Every sign-in and refresh rewrites both. With a static `rmk_`
+  key there is no sign-in and nothing is written.
+- **On every call.** Each forwarded `tools/call`, `prompts/get` and `resources/read` carries
+  `params._meta["io.ramen/evals"] = {"version": "<v>"}` next to the telemetry report. A worker whose group requires
+  evals answers `-32026 evals config required` / `evals config changed: sign in again` (HTTP 428) when the version is
+  missing or old; the bridge then signs in again once (refresh grant, else the browser flow as `-32001` with the link)
+  and retries that one call — exactly as for `-32025`. With a static key it adopts the version the worker named.
+- **At start.** The bridge loads the bundle from the last sign-in and signs in. Without a bundle and with no way to
+  sign in (no refresh token, `--no-browser`, and no terminal to read the URL from) it prints
+  `Ramen policy missing: reconnect (sign in) — Ramen cannot be used without it` to stderr and exits **3**; a sign-in
+  that fails for another reason exits 2 when a bundle exists, 3 when none does.
+- **Client config files** (default on; `--no-client-config` / `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1` skips them). At
+  sign-in the bridge tells the editors installed on this machine about the policy, writing only where the editor's
+  directory already exists, merging idempotently (your other keys survive, nothing is written twice) and marking its
+  entries `"_ramen": true`:
+  - **Claude Code** `~/.claude/settings.json` → a `hooks.SessionStart` entry running
+    `ramen-mcp-bridge policy check --target <host> --group <g> --zone <z>`, so every session starts with a check
+    against the console's current policy (non-zero exit = stale or missing, the reconnect message on stderr);
+  - **Cursor** `~/.cursor/rules/ramen-<g>-<z>.mdc` (`alwaysApply: true`, a `# ramen` line) stating whether telemetry
+    and evals are required, their versions, and the command to sign in again;
+  - **VS Code** user `settings.json` (`~/Library/Application Support/Code/User` on macOS, `~/.config/Code/User` on
+    Linux, `%APPDATA%\Code\User` on Windows) → `mcp.servers["ramen-<g>-<z>"]` = `uvx ramen-mcp-bridge@latest
+    --target … --tls --oauth … --client-id … --group … --zone …`.
+  A settings file the bridge cannot parse as plain JSON (comments, trailing commas) is left untouched with a warning.
+  A ledger `~/.ramen/clients.json` lists every file and key written.
+- **`ramen-mcp-bridge policy show|check|remove [--target --group --zone]`** (the flags may be omitted when there is one
+  bundle): `show` prints the bundle (never headers); `check` fetches
+  `https://<console>/.well-known/ramen-policy?group=&zone=` and exits 0 when the versions and `required` flags match,
+  2 when stale or missing (with the reconnect message), 1 when the console cannot be reached; `remove` reverts every
+  ledger entry for that (host, group, zone) and deletes the bundle and the evals config.
+
+**The honest limit.** The policy is enforced where Ramen is: the worker refuses a call that does not carry the current
+versions, and the bridge, the hook and the rule files make sure a client that goes through them learns it. An LLM
+that never uses the bridge or Ramen's workers cannot be forced by any of this; what it can be told is in its editor's
+config, which is why the files above exist.
+
 Point an MCP client at it directly:
 ```json
 {"mcpServers": {"ramen-stdio": {"command": "ramen-mcp-bridge",
@@ -95,7 +140,8 @@ Point an MCP client at it directly:
 ```
 
 Every flag has a `RAMEN_BRIDGE_*` environment variable equivalent (`--target` → `RAMEN_BRIDGE_TARGET`,
-`--tls` → `RAMEN_BRIDGE_TLS=1`, `--group` → `RAMEN_BRIDGE_GROUP`, `--zone` → `RAMEN_BRIDGE_ZONE`) so the key
+`--tls` → `RAMEN_BRIDGE_TLS=1`, `--group` → `RAMEN_BRIDGE_GROUP`, `--zone` → `RAMEN_BRIDGE_ZONE`,
+`--no-client-config` → `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1`) so the key
 never has to sit in a client's config file — `RAMEN_MCP_KEY` (or `RAMEN_BRIDGE_KEY`) is enough.
 `--health [SERVICE]` checks `grpc.health.v1` and exits 0 when SERVING, for a liveness probe.
 

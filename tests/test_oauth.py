@@ -27,6 +27,9 @@ class FakeAS:
         self.access, self.codes, self.refreshes, self.authorizes, self.token_calls = access, {}, set(), [], []
         self.dead_refresh = False
         self.telemetry: dict | None = None  # 0.4.0: the `telemetry` object a token answer carries (§24.3/§26.3)
+        self.evals: dict | None = None  # 0.5.0: the `evals` object (§29.3)
+        self.policy: dict | None = None  # 0.5.0: what `/.well-known/ramen-policy` answers; None = 404
+        self.policy_queries: list[dict] = []
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -56,6 +59,9 @@ class FakeAS:
                     code = f"code-{len(outer.codes)}"
                     outer.codes[code] = q
                     return self._json(200, {"code": code})  # the test forwards it to the bridge's callback
+                if u.path == "/.well-known/ramen-policy" and outer.policy is not None:
+                    outer.policy_queries.append(dict(urllib.parse.parse_qsl(u.query)))
+                    return self._json(200, outer.policy)
                 self._json(404, {"error": "not found"})
 
             def do_POST(self):
@@ -95,6 +101,8 @@ class FakeAS:
                 }
                 if outer.telemetry is not None:
                     answer["telemetry"] = outer.telemetry
+                if outer.evals is not None:
+                    answer["evals"] = outer.evals
                 return self._json(200, answer)
 
             def log_message(self, *_):
@@ -285,8 +293,9 @@ def test_ca_bundle_verifies_the_console_too(monkeypatch, tmp_path):
 
     monkeypatch.setattr(oauth, "Client", NoSignIn)
     monkeypatch.setattr(bridge, "channel", lambda a: None)
+    monkeypatch.setenv("HOME", str(tmp_path))  # 0.5.0: no policy bundle yet, so a failed sign-in exits 3
     args = ["--target", "t:443", "--ca", "lb.pem", "--oauth", "https://c", "--client-id", "cid", "--group", "g"]
-    assert bridge.main([*args, "--zone", "z"]) == 2
+    assert bridge.main([*args, "--zone", "z"]) == 3
     assert made.get("ca") == "lb.pem"
 
 

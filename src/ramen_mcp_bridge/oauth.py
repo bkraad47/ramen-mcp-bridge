@@ -202,6 +202,8 @@ class Client:
         self._meta: dict | None = None
         # 0.4.0: the token answer's `telemetry` object (§24.3/§26.3) — encrypted in this process, never in the store
         self.vault = Vault()
+        # 0.5.0: the policy bundle (§29.3) the answer's `telemetry` + `evals` feed, when the bridge keeps one
+        self.policy = None
         # `--ca` verifies the console as well as the worker: the AWS guide's console cert is self-signed
         self.context = ssl.create_default_context(cafile=ca) if ca else None
 
@@ -314,7 +316,11 @@ class Client:
 
     def _keep(self, tokens: dict) -> dict:
         tokens = dict(tokens)
-        self.vault.seal(tokens.pop("telemetry", None) or None)  # absent = telemetry off on the console
+        telemetry = tokens.pop("telemetry", None) or None  # absent = telemetry off on the console
+        evals = tokens.pop("evals", None) or None  # absent = the group repo carries no evals file
+        self.vault.seal(telemetry)
+        if self.policy is not None:
+            self.policy.update(telemetry, evals)
         tokens["expires_at"] = time.time() + float(tokens.get("expires_in") or 3600)
         self.tokens = tokens
         self.store.save(tokens)

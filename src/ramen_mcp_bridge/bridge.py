@@ -21,7 +21,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from ramen_proto.ramen.v1 import mcp_pb2, mcp_pb2_grpc
 
-from . import oauth
+from . import clients, oauth, policy
 from . import telemetry as tel
 
 CODES = {
@@ -86,6 +86,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(default 1800 = 30 minutes; 0 disables) (RAMEN_BRIDGE_IDLE_TIMEOUT)",
     )
     ap.add_argument("--no-browser", action="store_true", help="print the sign-in URL instead of opening a browser")
+    ap.add_argument(
+        "--no-client-config",
+        action="store_true",
+        default=_env("NO_CLIENT_CONFIG") in ("1", "true"),
+        help="do not write the policy into Claude Code / Cursor / VS Code config files at sign-in "
+        "(RAMEN_BRIDGE_NO_CLIENT_CONFIG=1)",
+    )
     a = ap.parse_args(argv)
     if not a.target:
         ap.error("--target (or RAMEN_BRIDGE_TARGET) is required")
@@ -150,13 +157,21 @@ def _error_code(reply: dict | None) -> int | None:
 
 class Bridge:
     def __init__(
-        self, stub: mcp_pb2_grpc.McpStub, metadata: list[tuple[str, str]], timeout: float, bearer=None, telemetry=None
+        self,
+        stub: mcp_pb2_grpc.McpStub,
+        metadata: list[tuple[str, str]],
+        timeout: float,
+        bearer=None,
+        telemetry=None,
+        pol: "policy.Policy | None" = None,
     ):
         """`bearer` (0.2.0): a callable giving the current access token — `bearer(force=True)` after the worker
         said UNAUTHENTICATED, once per call; without it `metadata` carries the static key. `telemetry` (0.4.0): the
-        vault holding the token answer's `telemetry` object plus the recorder of what the host did (§26.3)."""
+        vault holding the token answer's `telemetry` object plus the recorder of what the host did (§26.3). `pol`
+        (0.5.0): the policy bundle whose evals version rides on every gated call (§29.3)."""
         self.stub, self.metadata, self.timeout, self.bearer = stub, metadata, timeout, bearer
         self.telemetry = telemetry or tel.Telemetry()
+        self.policy = pol or policy.Policy()
 
     def _metadata(self, force: bool = False) -> list[tuple[str, str]]:
         if self.bearer is None:
@@ -196,16 +211,22 @@ class Bridge:
             return self.error_for(raw, e), False
 
     # --- 0.4.0: telemetry through Ramen (§26.3) ----------------------------------------------------------------
+    RETRY_CODES = (tel.REPORT_REQUIRED, tel.CONFIG_STALE, policy.EVALS_STALE)
+
     def _attach(self, raw: bytes, msg: dict) -> bytes:
-        """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]` — when the
-        bridge holds a config; the body is forwarded in the era the host spoke (the bridge does not upgrade eras)."""
-        version = self.telemetry.version()
-        if version is None:
+        """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]` and the
+        evals version under `params._meta["io.ramen/evals"]` (0.5.0) — each when the bridge holds one; the body is
+        forwarded in the era the host spoke (the bridge does not upgrade eras)."""
+        version, evals = self.telemetry.version(), self.policy.evals_version()
+        if version is None and evals is None:
             return raw
         out = dict(msg)
         params = dict(out.get("params") or {})
         meta = dict(params.get("_meta") or {})
-        meta[tel.META] = self.telemetry.recorder.take(version)
+        if version is not None:
+            meta[tel.META] = self.telemetry.recorder.take(version)
+        if evals is not None:
+            meta[policy.META] = {"version": evals}
         params["_meta"] = meta
         out["params"] = params
         return json.dumps(out).encode()
@@ -217,24 +238,32 @@ class Bridge:
         if not delivered:
             rec.restore()
             return reply
-        if code not in (tel.REPORT_REQUIRED, tel.CONFIG_STALE):
+        if code not in self.RETRY_CODES:
             rec.commit()
             return reply
         rec.restore()
-        why = "telemetry config changed" if code == tel.CONFIG_STALE else "telemetry report required"
+        why = {
+            tel.CONFIG_STALE: "telemetry config changed",
+            tel.REPORT_REQUIRED: "telemetry report required",
+            policy.EVALS_STALE: "evals config required or changed",
+        }[code]
         print(json.dumps({"level": "info", "msg": f"{why}; signing in again and retrying once"}), file=sys.stderr)
         if self.bearer is not None:
             try:
-                self.bearer(force=True)  # the refresh grant brings the current `telemetry` object; else the browser
+                self.bearer(force=True)  # the refresh grant brings the current policy; else the browser
             except oauth.SignInRequired as e:
                 return self.sign_in_error(raw, e)
             except oauth.OAuthError:
                 return reply
         named = ((_parse(reply) or {}).get("error", {}).get("data") or {}).get("version")
-        if (self.bearer is None or self.telemetry.version() is None) and isinstance(named, str):
-            self.telemetry.adopt(named)  # a static key cannot sign in: report under the version the worker named
+        if isinstance(named, str) and named:
+            # a static key cannot sign in: go on under the version the worker named
+            if code == policy.EVALS_STALE and (self.bearer is None or self.policy.evals_version() is None):
+                self.policy.adopt_evals(named)
+            elif code != policy.EVALS_STALE and (self.bearer is None or self.telemetry.version() is None):
+                self.telemetry.adopt(named)
         reply, delivered = self._exchange(self._attach(raw, msg))
-        if delivered and _error_code(_parse(reply)) not in (tel.REPORT_REQUIRED, tel.CONFIG_STALE):
+        if delivered and _error_code(_parse(reply)) not in self.RETRY_CODES:
             rec.commit()
         else:
             rec.restore()
@@ -319,7 +348,35 @@ def health(ch: grpc.Channel, service: str, timeout: float) -> int:
     return 0 if st == health_pb2.HealthCheckResponse.SERVING else 1
 
 
+def bridge_args(a: argparse.Namespace) -> list[str]:
+    """The `uvx` arguments a client config needs to start this very bridge (the sign-in guide's shape)."""
+    args = ["ramen-mcp-bridge@latest", "--target", a.target]
+    if a.ca:
+        args += ["--ca", a.ca]
+    elif a.use_tls:
+        args.append("--tls")
+    args += ["--oauth", a.oauth, "--client-id", a.client_id, "--group", a.group, "--zone", a.zone]
+    return args
+
+
+def can_sign_in(client: oauth.Client, a: argparse.Namespace) -> bool:
+    """False when nothing could complete a sign-in: no refresh token, no browser to open (`--no-browser`) and no
+    terminal where someone would read the printed URL."""
+    if (getattr(client, "tokens", None) or {}).get("refresh_token"):
+        return True
+    if not a.no_browser:
+        return True
+    try:
+        return sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv[:1] == ["policy"]:
+        return policy_main(argv[1:])
     a = parse_args(argv)
     ch = channel(a)
     if a.health is not None:
@@ -337,20 +394,78 @@ def main(argv: list[str] | None = None) -> int:
         client = oauth.Client(
             a.oauth, a.client_id, a.scope, store, opener=opener, ca=a.ca, idle_secs=max(0.0, a.idle_timeout)
         )
+        # 0.5.0: the policy bundle — loaded from the last sign-in, rewritten by every token answer (§29.3)
+        pol = policy.Policy(a.target, a.group, a.zone, a.oauth)
+        pol.load()
+        if not a.no_client_config:
+            uvx = bridge_args(a)
+            pol.on_update = lambda p: clients.install(p, uvx)
+        client.policy = pol
+        if pol.bundle is None and not can_sign_in(client, a):
+            print(policy.MISSING, file=sys.stderr)
+            return policy.EXIT_MISSING
         try:
             client.bearer()  # sign in before the first message, so the client's first request does not wait on a browser
         except oauth.OAuthError as e:
             print(f"ramen-mcp-bridge: {e}", file=sys.stderr)
+            if pol.bundle is None:
+                print(policy.MISSING, file=sys.stderr)
+                return policy.EXIT_MISSING
             return 2
         # while serving, a needed sign-in is reported to the client as an error carrying the URL, never a hang
 
         def bearer(force: bool = False) -> str:
             return client.bearer(force=force, nonblocking=True)
 
-        b = Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout, bearer=bearer, telemetry=tel.Telemetry(client.vault))
+        b = Bridge(
+            mcp_pb2_grpc.McpStub(ch), md, a.timeout, bearer=bearer, telemetry=tel.Telemetry(client.vault), pol=pol
+        )
         return serve(b, sys.stdin.buffer, sys.stdout.buffer)
     md = [("authorization", f"Bearer {a.key}"), *md]
     return serve(Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout), sys.stdin.buffer, sys.stdout.buffer)
+
+
+# --- 0.5.0: `ramen-mcp-bridge policy show|check|remove` (§29.3) --------------------------------------------------
+def policy_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="ramen-mcp-bridge policy", description="the policy bundle kept at sign-in")
+    ap.add_argument("action", choices=["show", "check", "remove"])
+    ap.add_argument("--target", default=_env("TARGET"), help="host:port the bundle was made for")
+    ap.add_argument("--group", default=_env("GROUP"))
+    ap.add_argument("--zone", default=_env("ZONE"))
+    ap.add_argument("--ca", default=_env("CA"), help="PEM CA bundle for the console (check)")
+    ap.add_argument("--timeout", type=float, default=10.0)
+    a = ap.parse_args(argv)
+    pol = policy.find(a.target, a.group, a.zone)
+    if pol is None:
+        n = len(policy.list_bundles())
+        if n > 1 and not (a.target and a.group and a.zone):
+            print(f"ramen-mcp-bridge policy: {n} bundles; name one with --target --group --zone", file=sys.stderr)
+            return 1
+        print(policy.MISSING, file=sys.stderr)
+        return 2
+    if a.action == "show":
+        print(json.dumps(pol.bundle, indent=1))
+        return 0
+    if a.action == "remove":
+        reverted = clients.remove(pol.target or "", pol.group, pol.zone)
+        pol.remove_files()
+        for e in reverted:
+            print(f"reverted {e['kind']}: {e['file']}" + (f" [{e['key']}]" if e.get("key") else ""), file=sys.stderr)
+        print(f"removed the policy bundle for {pol.group}/{pol.zone} on {pol.target}", file=sys.stderr)
+        return 0
+    import ssl
+
+    try:
+        current = pol.fetch_current(a.timeout, ssl.create_default_context(cafile=a.ca) if a.ca else None)
+    except RuntimeError as e:
+        print(f"ramen-mcp-bridge policy check: {e}", file=sys.stderr)
+        return 1
+    diff = pol.compare(current)
+    if diff:
+        print(policy.STALE + " (" + "; ".join(diff) + ")", file=sys.stderr)
+        return 2
+    print(f"Ramen policy up to date for {pol.group}/{pol.zone} on {pol.target}")
+    return 0
 
 
 if __name__ == "__main__":
