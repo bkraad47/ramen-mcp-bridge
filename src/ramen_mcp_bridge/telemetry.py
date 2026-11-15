@@ -20,6 +20,9 @@ GATED = frozenset({"tools/call", "prompts/get", "resources/read"})
 KINDS = ("mcp", "llm", "tool", "other")
 MAX_EVENTS, MAX_BYTES, MAX_REASONING, MAX_PENDING = 200, 64 * 1024, 4096, 2000
 REPORT_REQUIRED, CONFIG_STALE = -32024, -32025
+# §26.3: a 2025-06-18 body without the report is refused -32003 with this text (no `data`); for the bridge it means
+# the same as -32024 — a telemetry object is needed (P4-B3)
+FORBIDDEN, FORBIDDEN_TEXT = -32003, "requires telemetry"
 
 TOOL = {
     "name": "ramen_report",

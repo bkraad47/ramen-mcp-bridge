@@ -328,7 +328,7 @@ def test_hook_command_carries_no_client_scan_and_replaces_the_old_entry(home):  
     hooks = json.loads((home / ".claude" / "settings.json").read_text())["hooks"]["SessionStart"]
     assert len(hooks) == 1 and hooks[0]["hooks"][0]["command"].endswith("--zone a --no-client-scan")
     clients.remove(TARGET, "demo", "a")
-    assert "SessionStart" not in json.loads((home / ".claude" / "settings.json").read_text())["hooks"]
+    assert not (home / ".claude" / "settings.json").exists()  # the bridge created it; emptied again, it goes
 
 
 def test_main_flag_no_client_scan(monkeypatch):

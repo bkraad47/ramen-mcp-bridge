@@ -7,9 +7,12 @@ the group's policy, so an agent hears it even before its first Ramen call.
 - VS Code user `settings.json`: `mcp.servers["ramen-<group>-<zone>"]` pointing at the bridge
 
 Each is written only when the editor's directory exists, merged idempotently (other keys survive), and marked
-`"_ramen": true` (a `# ramen` line in the .mdc). A ledger `~/.ramen/clients.json` lists every file and key written so
-`policy remove` can revert exactly that. A JSON file the bridge cannot parse (comments, trailing commas) is left alone
-with a warning, never overwritten. An LLM that never uses the bridge or Ramen's workers cannot be forced — a limit.
+`"_ramen": true` (a `# ramen` line in the .mdc). When another host's sign-in already holds the plain Cursor / VS Code
+name for this group and zone, this host's takes the suffix `-<host>` (two hosts of one group on one machine). A ledger
+`~/.ramen/clients.json` lists every file and key written (with the file's pre-ramen bytes, token-free) so `policy
+remove` can revert exactly that — byte-for-byte when nothing else changed. A JSON file the bridge cannot parse
+(comments, trailing commas) is left alone with a warning, never overwritten. An LLM that never uses the bridge or
+Ramen's workers cannot be forced — a limit.
 """
 
 from __future__ import annotations
@@ -19,9 +22,10 @@ import os
 import sys
 from pathlib import Path
 
-from .policy import Policy, home, say, write_private
+from .policy import Policy, home, host_of, say, write_private
 
 MARK = "_ramen"
+IDENT = ("target", "group", "zone")
 SKILLSPECTOR_NOTE = (
     "SkillSpector required: this hook scans the skills on this machine (~/.claude/skills, ./.claude/skills, "
     "~/.codex/skills); a DO_NOT_INSTALL skill blocks Ramen until it is fixed or removed"
@@ -130,6 +134,19 @@ class Ledger:
         self.entries = [e for e in self.entries if e not in mine]
         return mine
 
+    def find(self, kind: str, ident: dict) -> dict | None:
+        """This (target, group, zone)'s entry of `kind`, if one was written before."""
+        return next(
+            (e for e in self.entries if e.get("kind") == kind and all(e.get(k) == v for k, v in ident.items())), None
+        )
+
+    def taken(self, kind: str, field: str, name: str, ident: dict) -> bool:
+        """Whether another (target, group, zone) holds `name` (a VS Code key, a Cursor file) for this kind."""
+        return any(
+            e.get("kind") == kind and e.get(field) == name and any(e.get(k) != v for k, v in ident.items())
+            for e in self.entries
+        )
+
     def save(self) -> None:
         if self.entries:
             write_private(self.path, json.dumps({"entries": self.entries}, indent=1) + "\n")
@@ -140,17 +157,37 @@ class Ledger:
                 pass
 
 
+def _before(ledger: Ledger, kind: str, path: Path, ident: dict, token: str) -> dict:
+    """The file's pre-ramen state for the ledger: taken at the first write, kept after; never a token."""
+    prev = ledger.find(kind, ident)
+    if prev is not None and "existed" in prev:
+        return {k: prev[k] for k in ("existed", "snapshot") if k in prev}
+    from .configs import secret
+
+    text = path.read_text() if path.exists() else None
+    return {"existed": text is not None, "snapshot": None if text is not None and secret(text, token) else text}
+
+
+def _name(ledger: Ledger, kind: str, field: str, base: str, suffixed: str, ident: dict, foreign: bool) -> str:
+    """The plain name unless another host's sign-in holds it (per the ledger, or the file says so): then `-<host>`."""
+    mine = ledger.find(kind, ident)
+    if mine is not None and mine.get(field) in (base, suffixed):
+        return mine[field]
+    return suffixed if (foreign or ledger.taken(kind, field, base, ident)) else base
+
+
 def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> list[dict]:
     """Write (or refresh) every client file for this (target, group, zone); the entries written."""
     target, group, zone = pol.target or "", pol.group, pol.zone
     ident = {"target": target, "group": group, "zone": zone}
-    ledger = Ledger()
+    ledger, token, host = Ledger(), pol.token or "", host_of(target)
     done: list[dict] = []
     note = {"_ramen_policy": SKILLSPECTOR_NOTE} if pol.skillspector_required() else {}
 
     claude = home() / ".claude"
     if claude.is_dir():
         path = claude / "settings.json"
+        before = _before(ledger, "claude_code", path, ident, token)
         settings = _read_json(path)
         if settings is not None:
             hooks = settings.setdefault("hooks", {}) if isinstance(settings.get("hooks"), dict | None) else None
@@ -167,12 +204,16 @@ def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> li
                     start[:] = [*(e for e in start if not _is_ours(e, key)), entry]
                     _write_json(path, settings)
                 if isinstance(start, list):
-                    done.append({"kind": "claude_code", "file": str(path), "key": key, **ident})
+                    done.append({"kind": "claude_code", "file": str(path), "key": key, **ident, **before})
 
     cursor = home() / ".cursor"
     if cursor.is_dir():
-        path = cursor / "rules" / f"ramen-{group}-{zone}.mdc"
+        rules, base = cursor / "rules", f"ramen-{group}-{zone}"
         text = rule_text(pol, bridge_args)
+        plain = rules / f"{base}.mdc"
+        foreign = plain.exists() and "# ramen" in plain.read_text() and f"at `{target}`" not in plain.read_text()
+        name = _name(ledger, "cursor", "file", str(plain), str(rules / f"{base}-{host}.mdc"), ident, foreign)
+        path = Path(name)
         if not path.exists() or path.read_text() != text:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
@@ -181,6 +222,7 @@ def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> li
     code = vscode_user_dir()
     if code.is_dir():
         path = code / "settings.json"
+        before = _before(ledger, "vscode", path, ident, token)
         settings = _read_json(path)
         if settings is not None:
             mcp = settings.get("mcp")
@@ -188,17 +230,20 @@ def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> li
                 mcp = settings["mcp"] = {}
             if isinstance(mcp, dict) and isinstance(mcp.get("servers", {}), dict):
                 servers = mcp.setdefault("servers", {})
-                key = f"ramen-{group}-{zone}"
+                base = f"ramen-{group}-{zone}"
+                have = servers.get(base)
+                foreign = isinstance(have, dict) and bool(have.get(MARK)) and target not in (have.get("args") or [])
+                key = _name(ledger, "vscode", "key", base, f"{base}-{host}", ident, foreign)
                 entry = {"command": "uvx", "args": list(bridge_args), MARK: True, **note}
                 if servers.get(key) != entry:
                     servers[key] = entry
                     _write_json(path, settings)
-                done.append({"kind": "vscode", "file": str(path), "key": key, **ident})
+                done.append({"kind": "vscode", "file": str(path), "key": key, **ident, **before})
             else:
                 say(f"ramen-mcp-bridge: {path}: `mcp.servers` is not an object; left unchanged")
 
     for e in done:
-        ledger.add(e)
+        ledger.upsert(e, ("kind", *IDENT))
     ledger.save()
     return done
 
@@ -210,17 +255,50 @@ def _is_ours(entry, cmd: str) -> bool:
     return any(isinstance(h, dict) and str(h.get("command", "")).startswith(cmd) for h in entry.get("hooks") or [])
 
 
+def _put_back(path: Path, settings: dict, entry: dict) -> None:
+    """The settings minus our part: the pre-ramen bytes when that is what is left, else the dumper's; a file Ramen
+    created and emptied again is deleted."""
+    snapshot, pruned = entry.get("snapshot"), _pruned(settings)
+    if not entry.get("existed", True) and not pruned:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    elif isinstance(snapshot, str) and _read_json_text(snapshot) in (settings, pruned):
+        path.write_text(snapshot)
+    else:
+        _write_json(path, settings)
+
+
+def _pruned(settings: dict) -> dict:
+    """`settings` without the containers our entry alone filled (`hooks`, `mcp.servers`, `mcp`) once they are empty."""
+    out = {k: v for k, v in settings.items() if not (k == "hooks" and v == {})}
+    mcp = out.get("mcp")
+    if isinstance(mcp, dict) and mcp.get("servers") == {}:
+        mcp = {k: v for k, v in mcp.items() if k != "servers"}
+        out = {**{k: v for k, v in out.items() if k != "mcp"}, **({"mcp": mcp} if mcp else {})}
+    return out
+
+
+def _read_json_text(text: str):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
 def remove(target: str, group: str, zone: str) -> list[dict]:
     """Revert every ledger entry of this (target, group, zone); the entries reverted."""
     from . import configs
 
     ledger = Ledger()
     mine = ledger.take(target, group, zone)
+    # §31.3: the configs and telemetry targets go back as they were, the last write first (two sources on one file)
+    configs.restore_all([e for e in mine if e.get("kind") == configs.KIND])
     for e in mine:
         path = Path(e.get("file", ""))
         kind, key = e.get("kind"), e.get("key", "")
-        if kind == configs.KIND:  # §31.3: a configs or telemetry target, put back as it was
-            configs.restore(e)
+        if kind == configs.KIND:
             continue
         if kind == "skill":  # §33.2: a file `skills install` wrote
             from . import skills
@@ -245,11 +323,11 @@ def remove(target: str, group: str, zone: str) -> list[dict]:
                     hooks["SessionStart"] = kept
                 else:
                     hooks.pop("SessionStart", None)
-                _write_json(path, settings)
+                _put_back(path, settings, e)
         elif kind == "vscode":
             servers = (settings.get("mcp") or {}).get("servers") if isinstance(settings.get("mcp"), dict) else None
             if isinstance(servers, dict) and isinstance(servers.get(key), dict) and servers[key].get(MARK):
                 del servers[key]
-                _write_json(path, settings)
+                _put_back(path, settings, e)
     ledger.save()
     return mine

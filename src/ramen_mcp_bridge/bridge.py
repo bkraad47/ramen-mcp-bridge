@@ -170,6 +170,16 @@ def _error_code(reply: dict | None) -> int | None:
     return err.get("code") if isinstance(err, dict) else None
 
 
+def _policy_code(reply: dict | None) -> int | None:
+    """The error code as the policy gates mean it: `-32003 … requires telemetry` (a legacy body without the report,
+    or without consent) counts as -32024 — one re-sign-in brings the telemetry object, then the retry carries it."""
+    err = (reply or {}).get("error")
+    code = err.get("code") if isinstance(err, dict) else None
+    if code == tel.FORBIDDEN and tel.FORBIDDEN_TEXT in str(err.get("message", "")):
+        return tel.REPORT_REQUIRED
+    return code
+
+
 class Bridge:
     def __init__(
         self,
@@ -291,14 +301,32 @@ class Bridge:
         err = {"code": policy.CONFIGS_STALE, "message": configs.REMOVED, "data": {"paths": broken}}
         return True, json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}).encode()
 
+    def _telemetry_in_hand(self, raw: bytes) -> bytes | None:
+        """P4-B3: the bundle says the group requires telemetry but no telemetry object is held (a still-valid
+        `--token-file` made no token request at start): one token request before the first gated call, so the call
+        carries the report instead of being refused."""
+        if self.bearer is None or not self.policy.telemetry_required() or self.telemetry.version() is not None:
+            return None
+        line = {"level": "info", "msg": "telemetry required; requesting the token answer's telemetry config"}
+        print(json.dumps(line), file=sys.stderr)
+        try:
+            self.bearer(force=True)
+        except oauth.SignInRequired as e:
+            return self.sign_in_error(raw, e)
+        except oauth.OAuthError:
+            pass
+        return None
+
     def _gated(self, raw: bytes, msg: dict) -> bytes | None:
         rec = self.telemetry.recorder
         if self.policy.target is not None:
             refused, reply = self._configs_in_place(raw)
             if refused:
                 return reply
+        if (reply := self._telemetry_in_hand(raw)) is not None:
+            return reply
         reply, delivered = self._exchange(self._attach(raw, msg))
-        code = _error_code(_parse(reply)) if delivered else None
+        code = _policy_code(_parse(reply)) if delivered else None
         if not delivered:
             rec.restore()
             return reply
@@ -324,7 +352,7 @@ class Bridge:
             elif key is None and (self.bearer is None or self.telemetry.version() is None):
                 self.telemetry.adopt(named)
         reply, delivered = self._exchange(self._attach(raw, msg))
-        if delivered and _error_code(_parse(reply)) not in self.RETRY_CODES:
+        if delivered and _policy_code(_parse(reply)) not in self.RETRY_CODES:
             rec.commit()
         else:
             rec.restore()

@@ -254,14 +254,16 @@ def test_apply_every_format_and_merge_idempotently_then_restore(home, capsys):  
     }
     # text block in Markdown: the HTML markers, appended after the user's text
     md = (home / ".claude" / "CLAUDE.md").read_text()
-    assert md == "# Mine\n\nkeep me\n<!-- ramen:demo -->\nUse the demo tools first.\n<!-- /ramen -->\n"
+    assert (
+        md == "# Mine\n\nkeep me\n<!-- ramen:ramen.example.com/demo -->\nUse the demo tools first.\n<!-- /ramen -->\n"
+    )
     # replace: the whole file is Ramen's; env keys: replaced by key in place, missing ones appended
     rule = home / ".cursor" / "rules" / "ramen-demo-a-ramen.example.com.mdc"
     assert rule.read_text() == "---\nalwaysApply: true\n---\nRamen group demo on ramen.example.com.\n"
     env = (home / ".ramen" / "demo.env").read_text()
     assert env == "MINE=1\nRAMEN_GROUP=demo\nexport RAMEN_ENDPOINT=https://c/otlp\n"
     # a plain text block in a new file: the `#` markers
-    assert (home / "notes.txt").read_text() == "# ramen:demo\nline from ramen\n# /ramen\n"
+    assert (home / "notes.txt").read_text() == "# ramen:ramen.example.com/demo\nline from ramen\n# /ramen\n"
     # idempotent: a second apply changes no byte and no ledger entry
     after = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
     ledger = ledger_text(home)
@@ -302,7 +304,7 @@ def test_apply_every_format_and_merge_idempotently_then_restore(home, capsys):  
     assert (
         (home / ".claude" / "CLAUDE.md")
         .read_text()
-        .endswith("more of mine\n<!-- ramen:demo -->\nUse the demo tools first.\n<!-- /ramen -->\n")
+        .endswith("more of mine\n<!-- ramen:ramen.example.com/demo -->\nUse the demo tools first.\n<!-- /ramen -->\n")
     )
     # remove: byte-for-byte where Ramen owned the file or a block and nothing else moved; Ramen's keys gone and the
     # prior values back where it merged; files Ramen created are deleted; the user's later edits stay
@@ -394,7 +396,9 @@ def test_telemetry_targets_env_sh_rc_block_codex_and_token_refresh(home, capsys)
     if os.name == "posix":
         assert mode(home / ".ramen" / "env.sh") == "0o600" and mode(home / ".claude" / "settings.json") == "0o600"
     zsh = (home / ".zshrc").read_text()
-    assert zsh == "export PATH=/x:$PATH\n# ramen:demo\n[ -f ~/.ramen/env.sh ] && . ~/.ramen/env.sh\n# /ramen\n"
+    assert zsh == (
+        "export PATH=/x:$PATH\n# ramen:ramen.example.com/demo\n[ -f ~/.ramen/env.sh ] && . ~/.ramen/env.sh\n# /ramen\n"
+    )
     assert not (home / ".bashrc").exists()
     import tomllib
 
@@ -425,7 +429,7 @@ def test_telemetry_targets_env_sh_rc_block_codex_and_token_refresh(home, capsys)
     configs.apply(pol, shell_rc=False)
     assert (home / ".zshrc").read_text() == "export PATH=/x:$PATH\n" and len(entries(home)) == 3
     configs.apply(pol)
-    assert "# ramen:demo" in (home / ".zshrc").read_text()
+    assert "# ramen:ramen.example.com/demo" in (home / ".zshrc").read_text()
     # telemetry no longer required: every target is put back
     pol.update({**TEL, "required": False}, None, None, None, token=TOKEN)
     configs.apply(pol)
@@ -436,6 +440,175 @@ def test_telemetry_targets_env_sh_rc_block_codex_and_token_refresh(home, capsys)
     # without a token (a bundle loaded from disk, nobody signed in yet) nothing with a token is written
     pol.update(TEL, None, None, None)
     assert configs.apply(pol) == []
+
+
+SHARED_MANIFEST = """version: 1
+targets:
+  - {client: claude-code, file: claude.json, path: ~/.claude/settings.json, format: json, merge: deep}
+  - {client: codex, file: codex.toml, path: ~/.codex/config.toml, format: toml, merge: deep}
+  - {client: claude-code, file: CLAUDE.md, path: ~/.claude/CLAUDE.md, format: text, merge: block}
+"""
+REPO_HOOK = {
+    "matcher": "",
+    "hooks": [{"type": "command", "command": "ramen-mcp-bridge policy check --target ${RAMEN_HOST} --group demo"}],
+}
+SHARED_FILES = {
+    "claude.json": json.dumps({"hooks": {"SessionStart": [REPO_HOOK]}, "model": "opus"}),
+    "codex.toml": '[ramen]\nhost = "${RAMEN_HOST}"\n',
+    "CLAUDE.md": "Use the ${RAMEN_GROUP} tools first.\n",
+}
+SHARED_CF = {**CF, "manifest": SHARED_MANIFEST, "files": SHARED_FILES}
+# two hosts cannot both own one leaf (`[ramen] host`): the two-host case leaves the Codex target out
+TWO_HOST_CF = {**SHARED_CF, "manifest": "\n".join(ln for ln in SHARED_MANIFEST.splitlines() if "codex" not in ln)}
+
+
+def seed_shared(home):  # noqa: F811
+    """One machine, every file in a shape the dumpers would not reproduce: byte-equality needs the snapshots."""
+    for d in (".claude", ".codex", ".cursor", ".ramen"):
+        (home / d).mkdir()
+    clients.vscode_user_dir().mkdir(parents=True)
+    other = {"matcher": "", "hooks": [{"type": "command", "command": "echo hi"}]}
+    (home / ".claude" / "settings.json").write_text(
+        '{"theme":"dark",\n "hooks": {"SessionStart": [' + json.dumps(other) + "]}}\n"
+    )
+    (home / ".codex" / "config.toml").write_text('model = "gpt"\n\n# mine\n[sandbox]\nmode = "loose"\n')
+    (home / ".claude" / "CLAUDE.md").write_text("# Mine\n\nkeep me\n")
+    (clients.vscode_user_dir() / "settings.json").write_text('{"editor.fontSize": 14}\n')
+    return {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+
+
+def sign_in(home, target, zone="a", configs_obj=SHARED_CF, tel=TEL):  # noqa: F811
+    """What `connect`'s on_update does after a token answer: the client files, then the configs / telemetry targets."""
+    pol = policy.Policy(target, "demo", zone, "https://c")
+    pol.update(tel, None, None, configs_obj, token=TOKEN, user="ada@example.com")
+    clients.install(pol, ["ramen-mcp-bridge@latest", "--target", target, "--tls"])
+    configs.apply(pol, shell_rc=False)
+    return pol
+
+
+def test_repo_and_telemetry_targets_on_one_file_each_keep_their_own_entry_and_remove_restores_bytes(home):  # noqa: F811
+    original = seed_shared(home)
+    pol = sign_in(home, TARGET)
+    # P4-B2: one ledger entry per (path, source) — the telemetry target no longer replaces the repo's
+    by_path = {}
+    for e in entries(home):
+        by_path.setdefault(e["path"], []).append(e["source"])
+    assert by_path[str(home / ".claude" / "settings.json")] == ["repo", "telemetry"]
+    assert by_path[str(home / ".codex" / "config.toml")] == ["repo", "telemetry"]
+    assert TOKEN not in ledger_text(home)
+    claude = json.loads((home / ".claude" / "settings.json").read_text())
+    assert claude["model"] == "opus" and claude["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"] == "https://c/otlp"
+    import tomllib
+
+    codex = tomllib.loads((home / ".codex" / "config.toml").read_text())
+    assert codex["ramen"] == {"host": "ramen.example.com"} and "otel" in codex and codex["model"] == "gpt"
+    # P4-B4: the repo's hooks.SessionStart list is merged by command — the user's hook and the bridge's own stay
+    start = claude["hooks"]["SessionStart"]
+    cmds = [h["command"] for e in start for h in e["hooks"]]
+    assert cmds == [
+        "echo hi",
+        f"ramen-mcp-bridge policy check --target {TARGET} --group demo --zone a",
+        "ramen-mcp-bridge policy check --target ramen.example.com --group demo",
+    ]
+    assert start[1]["_ramen"] is True
+    after = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    sign_in(home, TARGET)  # idempotent: a second sign-in adds nothing
+    assert {p: p.read_bytes() for p in home.rglob("*") if p.is_file()} == after
+    assert configs.verify(pol) == []
+    # the repo's hook taken out by the user counts as a change; the bridge's own hook moving does not
+    s = json.loads((home / ".claude" / "settings.json").read_text())
+    s["hooks"]["SessionStart"] = [s["hooks"]["SessionStart"][i] for i in (2, 0, 1)]
+    (home / ".claude" / "settings.json").write_text(json.dumps(s))
+    assert configs.verify(pol) == []
+    s["hooks"]["SessionStart"] = s["hooks"]["SessionStart"][1:]
+    (home / ".claude" / "settings.json").write_text(json.dumps(s))
+    assert configs.verify(pol) == [str(home / ".claude" / "settings.json")]
+    sign_in(home, TARGET)
+    assert configs.verify(pol) == []
+    # remove: every Ramen-written leaf of both sources goes, every file is byte-equal to the original
+    clients.remove(TARGET, "demo", "a")
+    pol.remove_files()  # what `policy remove` does next: the bundle and the configs directory
+    assert entries(home) == [] and not (home / ".ramen" / "clients.json").exists()
+    now = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    assert now == original, {
+        p: (now.get(p), original.get(p))
+        for p in set(now) ^ set(original) | {p for p in now if now[p] != original.get(p)}
+    }
+
+
+def test_two_hosts_of_one_group_coexist_and_remove_touches_one(home):  # noqa: F811
+    original = seed_shared(home)
+    other_target = "other.example.com:443"
+    code = clients.vscode_user_dir() / "settings.json"
+    pol_a = sign_in(home, TARGET, configs_obj=TWO_HOST_CF, tel=None)
+    after_a = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    pol_b = sign_in(home, other_target, configs_obj=TWO_HOST_CF, tel=None)
+    # P4-B5: blocks are marked per host; VS Code and Cursor names take a host suffix when the plain name is taken
+    md = (home / ".claude" / "CLAUDE.md").read_text()
+    assert md == (
+        "# Mine\n\nkeep me\n<!-- ramen:ramen.example.com/demo -->\nUse the demo tools first.\n<!-- /ramen -->\n"
+        "<!-- ramen:other.example.com/demo -->\nUse the demo tools first.\n<!-- /ramen -->\n"
+    )
+    servers = json.loads(code.read_text())["mcp"]["servers"]
+    assert set(servers) == {"ramen-demo-a", "ramen-demo-a-other.example.com"}
+    assert (
+        servers["ramen-demo-a"]["args"][2] == TARGET
+        and servers["ramen-demo-a-other.example.com"]["args"][2] == other_target
+    )
+    rules = sorted(p.name for p in (home / ".cursor" / "rules").iterdir())
+    assert rules == ["ramen-demo-a-other.example.com.mdc", "ramen-demo-a.mdc"]
+    assert f"at `{other_target}`" in (home / ".cursor" / "rules" / "ramen-demo-a-other.example.com.mdc").read_text()
+    hooks = json.loads((home / ".claude" / "settings.json").read_text())["hooks"]["SessionStart"]
+    assert sum(f"--target {TARGET} " in json.dumps(e) for e in hooks) == 1
+    assert sum(f"--target {other_target} " in json.dumps(e) for e in hooks) == 1
+    assert configs.verify(pol_a) == [] and configs.verify(pol_b) == []
+    # a second sign-in of either keeps its names
+    sign_in(home, other_target, configs_obj=TWO_HOST_CF, tel=None)
+    assert set(json.loads(code.read_text())["mcp"]["servers"]) == {"ramen-demo-a", "ramen-demo-a-other.example.com"}
+    assert sorted(p.name for p in (home / ".cursor" / "rules").iterdir()) == rules
+    # remove the second host: the first host's files are exactly as they were after its sign-in
+    clients.remove(other_target, "demo", "a")
+    pol_b.remove_files()
+    now = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    assert {p: v for p, v in now.items() if "clients.json" not in str(p)} == {
+        p: v for p, v in after_a.items() if "clients.json" not in str(p)
+    }
+    assert {e["target"] for e in json.loads(ledger_text(home))["entries"]} == {TARGET}
+    clients.remove(TARGET, "demo", "a")
+    pol_a.remove_files()
+    assert {p: p.read_bytes() for p in home.rglob("*") if p.is_file()} == original
+
+
+def test_old_group_marker_is_migrated_and_a_block_only_file_is_never_left_empty(home):  # noqa: F811
+    (home / ".claude").mkdir()
+    (home / ".ramen").mkdir()
+    (home / ".claude" / "CLAUDE.md").write_text("# Mine\n")
+    cf = {**CF, "manifest": SHARED_MANIFEST, "files": SHARED_FILES}
+    pol = sign_in(home, TARGET, configs_obj=cf, tel=None)
+    md_path = home / ".claude" / "CLAUDE.md"
+    new_open = "<!-- ramen:ramen.example.com/demo -->"
+    assert md_path.read_text() == f"# Mine\n{new_open}\nUse the demo tools first.\n<!-- /ramen -->\n"
+    # a 0.6.0 ledger entry and file with the old `ramen:<group>` marker: still verified, rewritten in the new form
+    md_path.write_text(md_path.read_text().replace(new_open, "<!-- ramen:demo -->"))
+    ledger = json.loads(ledger_text(home))
+    for e in ledger["entries"]:
+        if e.get("path") == str(md_path):
+            e["owned"] = ["<!-- ramen:demo -->", "<!-- /ramen -->"]
+    policy.write_private(home / ".ramen" / "clients.json", json.dumps(ledger))
+    assert configs.verify(pol) == []
+    configs.apply(pol, shell_rc=False)
+    assert md_path.read_text() == f"# Mine\n{new_open}\nUse the demo tools first.\n<!-- /ramen -->\n"
+    assert md_path.read_text().count("<!-- ramen:") == 1 and configs.verify(pol) == []
+    # a foreign old-form block is not ours: it stays, ours is added after it
+    md_path.write_text("<!-- ramen:demo -->\ntheirs\n<!-- /ramen -->\n")
+    configs.apply(pol, shell_rc=False)
+    assert md_path.read_text() == (
+        f"<!-- ramen:demo -->\ntheirs\n<!-- /ramen -->\n{new_open}\nUse the demo tools first.\n<!-- /ramen -->\n"
+    )
+    # the user emptied everything but our block: remove puts the pre-block content back, never an empty file
+    md_path.write_text(f"{new_open}\nUse the demo tools first.\n<!-- /ramen -->\n")
+    clients.remove(TARGET, "demo", "a")
+    assert md_path.read_text() == "# Mine\n"
 
 
 def test_main_signs_in_and_applies_configs_and_telemetry(home, fake, auth_cf, monkeypatch):  # noqa: F811

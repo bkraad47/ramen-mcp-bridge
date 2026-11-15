@@ -84,8 +84,13 @@ outcome and the model's reasoning — never arguments or results. The bridge is 
   rest goes with the next one). The body is forwarded in the MCP era the host spoke; a host on 2025-06-18 stays legacy.
 - `-32025 telemetry config changed` → the bridge signs in again (refresh grant, else the browser flow, reported as
   `-32001` with the link while serving) and retries that one call. `-32024 telemetry report required` when the bridge
-  holds no config → it signs in again; with a static `rmk_` key it adopts the version the worker named. The consent
-  checkbox on the sign-in page is unchanged: declining ends the sign-in.
+  holds no config → it signs in again; with a static `rmk_` key it adopts the version the worker named. A worker's
+  `-32003 forbidden: this group requires telemetry …` (what a legacy body without the report gets) is treated the same
+  way: one re-sign-in, then the retry carries the report. The consent checkbox on the sign-in page is unchanged:
+  declining ends the sign-in.
+- Started from a still-valid `--token-file` the bridge makes no token request, so it holds no telemetry object; when
+  the bundle says the group requires telemetry it asks for the token (refresh grant) before its first gated call, so
+  that call already carries the report.
 
 ## The policy bundle and your editors (0.5.0)
 
@@ -120,7 +125,11 @@ config text) — Ramen 1.0.0c, CONTRACTS §29.3. The bridge keeps and enforces i
     Linux, `%APPDATA%\Code\User` on Windows) → `mcp.servers["ramen-<g>-<z>"]` = `uvx ramen-mcp-bridge@latest
     --target … --tls --oauth … --client-id … --group … --zone …`.
   A settings file the bridge cannot parse as plain JSON (comments, trailing commas) is left untouched with a warning.
-  A ledger `~/.ramen/clients.json` lists every file and key written.
+  A ledger `~/.ramen/clients.json` lists every file and key written, with each editor file's pre-ramen bytes (never a
+  token), so `policy remove` gives the file back byte-for-byte when nothing else changed. Two hosts of one group and
+  zone on one machine coexist: when another host's sign-in already holds `ramen-<g>-<z>` (the Cursor rule, the VS Code
+  server), this host's entry is named `ramen-<g>-<z>-<host>`; the Claude Code hook names its host in the command.
+  `policy remove --target <host> …` touches only that host's entries.
 - **`ramen-mcp-bridge policy show|check|remove [--target --group --zone]`** (the flags may be omitted when there is one
   bundle): `show` prints the bundle (never headers); `check` fetches
   `https://<console>/.well-known/ramen-policy?group=&zone=` and exits 0 when the versions and `required` flags match,
@@ -166,10 +175,13 @@ them:
 - **Every target written.** `path` expands `~`, `{group}`, `{zone}`, `{host}`; a fragment may use
   `${RAMEN_OTLP_ENDPOINT}`, `${RAMEN_OTLP_HEADERS}`, `${RAMEN_USER}`, `${RAMEN_GROUP}`, `${RAMEN_HOST}`, filled at
   write time (the token never leaves this machine). `format: json | toml | yaml` with `merge: deep` sets Ramen's keys
-  and leaves yours alone; `text` with `merge: block` keeps one `# ramen:<group>` … `# /ramen` block (in `.md` files
-  `<!-- ramen:<group> -->` … `<!-- /ramen -->`), replaced in place; `env` with `merge: keys` replaces `KEY=value`
-  lines by key and appends the rest; `merge: replace` makes the whole file Ramen's. Writes are idempotent; a JSON /
-  TOML / YAML file the bridge cannot parse is left alone with a note.
+  and leaves yours alone — a Claude Code `hooks.<Event>` list is merged by hook command, so the bridge's own
+  `policy check` hook and your hooks stay and the repo's entries are added once; `text` with `merge: block` keeps one
+  `# ramen:<host>/<group>` … `# /ramen` block (in `.md` files `<!-- ramen:<host>/<group> -->` … `<!-- /ramen -->`),
+  replaced in place (a block in the older `ramen:<group>` form that this host wrote is recognised and rewritten; another
+  host's is left alone); `env` with `merge: keys` replaces `KEY=value` lines by key and appends the rest;
+  `merge: replace` makes the whole file Ramen's. Writes are idempotent; a JSON / TOML / YAML file the bridge cannot
+  parse is left alone with a note.
 - **Telemetry targets** (built in, written when the group requires telemetry): Claude Code's `~/.claude/settings.json`
   gets `env` with `CLAUDE_CODE_ENABLE_TELEMETRY=1`, the three `OTEL_*_EXPORTER=otlp`,
   `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, `OTEL_EXPORTER_OTLP_ENDPOINT=https://<console>/otlp`,
@@ -182,14 +194,17 @@ them:
   these files is the bridge's current access token: every refresh rewrites them, `policy remove` strips them. Tokens
   never appear on stderr or in the ledger.
 - **Ledger and checks.** `~/.ramen/clients.json` records every write (path, format, merge, version, the sha256 of the
-  ramen-owned part, the pre-ramen snapshot). `policy check` verifies each recorded target still holds its block / keys
+  ramen-owned part, the pre-ramen snapshot) — one entry per file and source, so a repo fragment and the built-in
+  telemetry target on the same file (`~/.claude/settings.json`, `~/.codex/config.toml`) each keep their own keys and
+  snapshot, and `policy remove` restores both. `policy check` verifies each recorded target still holds its block / keys
   and the telemetry env where written; anything missing → exit **3**,
   `Ramen configs removed or changed: reconnect (sign in) — Ramen cannot be used without them`. The running bridge
   makes the same check before every gated call: a missing target triggers one re-sign-in (which writes the files
   again); still missing, the call is refused with that message and the paths. `policy show` lists every target and
-  whether it is in place; `policy remove` puts files back byte-for-byte where Ramen owned the file or a block and
-  nothing else changed, removes Ramen's keys (restoring your prior values) where it merged, and deletes files it
-  created.
+  whether it is in place; `policy remove` puts files back byte-for-byte where nothing else changed since the write
+  (whole files, blocks and merged keys alike), removes Ramen's keys (restoring your prior values) where it merged,
+  deletes files it created, and gives a file that held nothing but Ramen's block its pre-block content back — never an
+  empty file.
 - **On every call** `params._meta["io.ramen/configs"] = {"version": "<v>"}` rides with the other versions; a worker
   answering `-32028 configs required` / `configs changed: sign in again` (HTTP 428) makes the bridge sign in again
   once and retry — and a new version means a new acceptance.

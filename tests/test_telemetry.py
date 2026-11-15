@@ -14,6 +14,9 @@ from ramen_proto.ramen.v1 import mcp_pb2_grpc
 
 CFG = {"otlp_endpoint": "http://collector.example:4318", "headers": {"x-api-key": "hunter2"}, "version": "abc123def456"}
 GATED = ("tools/call", "prompts/get", "resources/read")
+FORBIDDEN = (
+    "forbidden: this group requires telemetry; use a client that reports it (MCP 2026-07-28 or the Ramen bridge)"
+)
 
 
 def req(rid, method, **params) -> bytes:
@@ -96,8 +99,8 @@ def test_recorder_seq_limits_and_reasoning_cap():
 class TelFake:
     """A fake worker enforcing §26.3: gated calls need the report with the current version."""
 
-    def __init__(self, fake, version="abc123def456", require=True):  # noqa: F811
-        self.inner, self.version, self.require = fake, version, require
+    def __init__(self, fake, version="abc123def456", require=True, legacy=False):  # noqa: F811
+        self.inner, self.version, self.require, self.legacy = fake, version, require, legacy
         self.bodies: list[bytes] = []
         fake.hook = self.gate
 
@@ -106,6 +109,8 @@ class TelFake:
         if msg.get("method") not in GATED or not self.require:
             return None
         rep = meta_of(json.dumps(msg).encode())
+        if rep is None and self.legacy:  # §26.3: a 2025-06-18 body without the report, no `data`
+            return {"code": -32003, "message": FORBIDDEN}
         if rep is None:
             return {"code": -32024, "message": "telemetry report required", "data": {"version": self.version}}
         if rep["version"] != self.version:
@@ -239,6 +244,53 @@ def test_missing_config_signs_in_then_retries_or_adopts_the_version(tel, fake, a
     out = json.loads(run(k, req(2, "tools/call", name="add", arguments={"a": 1, "b": 1})))
     assert out["result"]["content"][0]["text"] == "2" and meta_of(tel.bodies[-1])["version"] == tel.version
     assert k.telemetry.vault.open() == {"version": tel.version}
+
+
+def test_token_file_start_gets_a_telemetry_object_first(fake, auth_tel, tmp_path, monkeypatch, capsys):  # noqa: F811
+    """P4-B3: a still-valid --token-file means no token request at start, so no telemetry object; the bundle says
+    the group requires telemetry → one refresh before the first gated call; a worker's `-32003 … requires
+    telemetry` (legacy body, no report) is one re-sign-in and a retry, like -32024."""
+    from ramen_mcp_bridge import policy
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    w = TelFake(fake, legacy=True)
+    auth_tel.telemetry = {**CFG, "required": True}
+    target, store = "ramen.example.com:443", tmp_path / "t.json"
+    first = oauth.Client(auth_tel.url, "cid", "mcp:demo:local", oauth.TokenFile(store), opener=auth_tel.browser)
+    first.policy = policy.Policy(target, "demo", "local", auth_tel.url)
+    first.bearer()
+    assert first.policy.telemetry_required() and len(auth_tel.token_calls) == 1
+    # a new process: tokens from the file (still valid), the bundle from disk, nothing in the vault
+    pol = policy.Policy(target, "demo", "local", auth_tel.url)
+    pol.load()
+    c = oauth.Client(auth_tel.url, "cid", "mcp:demo:local", oauth.TokenFile(store), opener=auth_tel.browser)
+    c.policy = pol
+    assert c.bearer() == "good" and c.vault.open() is None and len(auth_tel.token_calls) == 1
+    stub = mcp_pb2_grpc.McpStub(grpc.insecure_channel(fake.target))
+    md = [("ramen-group", "demo"), ("ramen-zone", "local")]
+
+    def bearer(force=False):
+        return c.bearer(force=force, nonblocking=True)
+
+    b = bridge.Bridge(stub, md, 5.0, bearer=bearer, telemetry=telemetry.Telemetry(c.vault), pol=pol)
+    call = req(1, "tools/call", name="add", arguments={"a": 1, "b": 2})
+    assert json.loads(run(b, call))["result"]["content"][0]["text"] == "3"
+    assert auth_tel.token_calls[-1]["grant_type"] == "refresh_token" and len(auth_tel.token_calls) == 2
+    assert len(w.bodies) == 1 and meta_of(w.bodies[0])["version"] == CFG["version"]  # the first body carries it
+    err = capsys.readouterr().err
+    assert "telemetry required" in err and "hunter2" not in err
+    # an older bundle that does not say required: the worker's -32003 is one re-sign-in, then the retry passes
+    c2 = oauth.Client(auth_tel.url, "cid", "mcp:demo:local", oauth.TokenFile(store), opener=auth_tel.browser)
+    assert c2.bearer() == "good" and c2.vault.open() is None
+    b2 = make(fake, vault=c2.vault, bearer=lambda force=False: c2.bearer(force=force, nonblocking=True))
+    assert json.loads(run(b2, call))["result"]["content"][0]["text"] == "3"
+    assert len(w.bodies) == 3 and meta_of(w.bodies[1]) is None and meta_of(w.bodies[2])["version"] == CFG["version"]
+    assert len(auth_tel.token_calls) == 3 and len(auth_tel.authorizes) == 1
+    assert "telemetry report required; signing in again and retrying once" in capsys.readouterr().err
+    # a static key cannot sign in and the refusal names no version: the error reaches the host after one retry
+    k = make(fake)
+    out = json.loads(run(k, call))
+    assert out["error"]["code"] == -32003 and out["error"]["message"] == FORBIDDEN and len(w.bodies) == 5
 
 
 def test_events_survive_a_failed_transport_and_nothing_leaks_to_stderr(tel, fake, capsys):  # noqa: F811

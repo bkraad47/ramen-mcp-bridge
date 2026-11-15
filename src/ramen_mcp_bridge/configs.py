@@ -8,9 +8,12 @@ Claude Code `~/.claude/settings.json` (`env`), `~/.ramen/env.sh`, a block in `~/
 ramen-owned part, the pre-ramen snapshot) so `policy check` can tell a removed block from a kept one and `policy
 remove` can put the file back. Tokens appear in the files that need them, never in the ledger or on stderr.
 
-Formats and merges: `json | toml | yaml` with `deep` (Ramen's keys win, the user's others stay), `text` with `block`
-(`# ramen:<group>` … `# /ramen`; `<!-- ramen:<group> -->` … `<!-- /ramen -->` in Markdown), `env` with `keys`
-(`KEY=value` lines replaced by key), and `replace` (the whole file is Ramen's) for any format.
+Formats and merges: `json | toml | yaml` with `deep` (Ramen's keys win, the user's others stay; Claude Code
+`hooks.<Event>` lists are merged by hook command so the bridge's own hook and the user's survive), `text` with `block`
+(`# ramen:<host>/<group>` … `# /ramen`; `<!-- ramen:<host>/<group> -->` … `<!-- /ramen -->` in Markdown; the 0.6.0
+`ramen:<group>` form is still read and rewritten), `env` with `keys` (`KEY=value` lines replaced by key), and `replace`
+(the whole file is Ramen's) for any format. One ledger entry per (path, source): a repo fragment and the built-in
+telemetry target on the same file each keep their own owned keys and pre-ramen snapshot.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ REMOVED = "Ramen configs removed or changed: reconnect (sign in) — Ramen canno
 EXIT_REMOVED = 3
 MISSING = "\0missing"
 ENV_LINE = re.compile(r"^(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+HOOKS_KEY = "hooks"  # ledger: {json path: [hook keys]} for the Claude Code hook lists a fragment merged into
 PLACEHOLDERS = ("RAMEN_OTLP_ENDPOINT", "RAMEN_OTLP_HEADERS", "RAMEN_USER", "RAMEN_GROUP", "RAMEN_HOST")
 
 
@@ -71,6 +75,12 @@ def sha(text: str) -> str:
 
 def digest(pairs: list) -> str:
     return sha(json.dumps(pairs, sort_keys=True, default=str))
+
+
+def secret(value, token: str) -> bool:
+    """Whether a pre-ramen value may carry a token (ours, or another host's bearer): it never enters the ledger."""
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return (bool(token) and token in text) or "Bearer " in text
 
 
 class Ctx:
@@ -164,11 +174,37 @@ def del_path(obj: dict, path: list) -> None:
             del obj[path[0]]
 
 
+# --- Claude Code hook lists (P4-B4) ------------------------------------------------------------------------------
+def is_hook_list(path: list, value) -> bool:
+    """`hooks.<Event>` in a Claude Code settings file: a list of `{matcher, hooks: [{type, command}]}` entries."""
+    return len(path) == 2 and path[0] == "hooks" and isinstance(value, list) and all(isinstance(e, dict) for e in value)
+
+
+def hook_key(entry) -> str:
+    """One hook entry's identity: its commands (the bridge's own `policy check …` differs from a repo's by target)."""
+    cmds = sorted(str(h.get("command", "")) for h in (entry.get("hooks") or []) if isinstance(h, dict))
+    return json.dumps(cmds) if cmds else json.dumps(entry, sort_keys=True, default=str)
+
+
+def merge_hooks(cur, frag: list) -> list:
+    """The fragment's entries replace those with the same commands (so they are added once); every other entry —
+    the user's, the bridge's own hook — stays where it was."""
+    keys = {hook_key(e) for e in frag}
+    return [e for e in (cur if isinstance(cur, list) else []) if hook_key(e) not in keys] + list(frag)
+
+
+def project_hooks(cur, keys: list):
+    """The entries of `cur` that carry `keys`, in that order; MISSING when one is gone."""
+    have = {hook_key(e): e for e in cur} if isinstance(cur, list) else {}
+    return MISSING if any(k not in have for k in keys) else [have[k] for k in keys]
+
+
 # --- text blocks ------------------------------------------------------------------------------------------------
-def markers(path: Path, group: str) -> tuple[str, str]:
+def markers(path: Path, host: str, group: str) -> tuple[str, str]:
+    name = f"{host}/{group}" if host else group
     if path.suffix.lower() in (".md", ".markdown"):
-        return f"<!-- ramen:{group} -->", "<!-- /ramen -->"
-    return f"# ramen:{group}", "# /ramen"
+        return f"<!-- ramen:{name} -->", "<!-- /ramen -->"
+    return f"# ramen:{name}", "# /ramen"
 
 
 def find_block(lines: list[str], open_: str, close: str) -> tuple[int, int] | None:
@@ -295,8 +331,22 @@ def owned_hash(entry: dict, text: str | None) -> str | None:
     cur = load(fmt, text)
     if cur is None:
         return None
-    vals = [[p, get_path(cur, p)] for p in owned]
+    hooks = entry.get(HOOKS_KEY) or {}
+    vals = [[p, owned_value(cur, p, hooks)] for p in owned]
     return None if any(v == MISSING for _, v in vals) else digest(vals)
+
+
+def owned_value(obj, path: list, hooks: dict):
+    """The leaf at `path` — for a merged hook list, only the fragment's entries of it."""
+    v = get_path(obj, path)
+    keys = hooks.get(json.dumps(path))
+    return project_hooks(v, keys) if keys is not None and v != MISSING else v
+
+
+def keep(entry: dict, key: str, value, token: str) -> None:
+    """The pre-ramen state is taken at the first write and kept; a value that may hold a token is not kept."""
+    if key not in entry:
+        entry[key] = None if value is not None and secret(value, token) else value
 
 
 def apply_target(t: Target, ctx: Ctx, before: dict | None, ident: dict, version: str) -> dict | None:
@@ -316,27 +366,31 @@ def apply_target(t: Target, ctx: Ctx, before: dict | None, ident: dict, version:
     if before is not None:  # the pre-ramen state was taken at the first write; it is kept, never the token
         entry.update({k: before[k] for k in ("existed", "snapshot", "prior") if k in before})
     private = bool(ctx.token) and ctx.token in t.text
+    token = ctx.token
     if t.merge == "replace":
         entry.setdefault("existed", existed)
-        entry.setdefault("snapshot", cur)
+        keep(entry, "snapshot", cur, token)
         entry["owned"], entry["hash"] = [], sha(t.text)
         if cur != t.text:
             write_text(t.path, t.text, private)
         return entry
     if t.merge == "block":
-        open_, close = markers(t.path, ctx.group)
+        open_, close = markers(t.path, ctx.host, ctx.group)
+        prev = (before or {}).get("owned") or []
+        if cur and len(prev) == 2 and prev[0] != open_ and find_block(cur.split("\n"), *prev) is not None:
+            cur = without_block(cur, *prev)  # our own block in the 0.6.0 `ramen:<group>` form: rewritten below
         entry.setdefault("existed", existed)
-        entry.setdefault("snapshot", without_block(cur or "", open_, close) if existed else None)
+        keep(entry, "snapshot", without_block(cur or "", open_, close) if existed else None, token)
         entry["owned"], entry["hash"] = [open_, close], sha(t.text.rstrip())
         new = with_block(cur or "", open_, close, t.text)
-        if new != cur:
+        if new != read_text(t.path):
             write_text(t.path, new, private)
         return entry
     if t.merge == "keys":
         ours = env_lines(t.text)
         have = {k: ln.rstrip() for ln in (cur or "").splitlines() if (k := env_key(ln)) in ours}
         entry.setdefault("existed", existed)
-        entry.setdefault("prior", have)
+        keep(entry, "prior", {k: v for k, v in have.items() if not secret(v, token)}, token)
         entry["owned"], entry["hash"] = sorted(ours), digest(sorted(ours.items()))
         new = with_keys(cur or "", ours)
         if new != cur:
@@ -350,21 +404,29 @@ def apply_target(t: Target, ctx: Ctx, before: dict | None, ident: dict, version:
         say(f"ramen-mcp-bridge: {t.path} is not plain {t.fmt}; left unchanged — add the Ramen keys by hand")
         return None
     pairs = leaves(frag)
+    hooks = {json.dumps(p): [hook_key(e) for e in v] for p, v in pairs if is_hook_list(p, v)}
     entry.setdefault("existed", existed)
-    entry.setdefault("prior", {json.dumps(p): v for p, v in ((p, get_path(obj, p)) for p, _ in pairs) if v != MISSING})
-    entry["owned"], entry["hash"] = [p for p, _ in pairs], digest([[p, v] for p, v in pairs])
-    changed = any(get_path(obj, p) != v for p, v in pairs)
+    keep(entry, "snapshot", cur, token)
+    prior = {}
+    for p, _ in pairs:
+        v = owned_value(obj, p, hooks)
+        if v != MISSING and not secret(v, token):
+            prior[json.dumps(p)] = v
+    entry.setdefault("prior", prior)
+    entry["owned"], entry["hash"] = [p for p, _ in pairs], digest([[p, owned_value(frag, p, hooks)] for p, _ in pairs])
+    entry[HOOKS_KEY] = hooks
     for p, v in pairs:
-        set_path(obj, p, v)
-    if changed or not existed:
-        write_text(t.path, DUMP[t.fmt](obj), private)
+        set_path(obj, p, merge_hooks(get_path(obj, p), v) if json.dumps(p) in hooks else v)
+    new = DUMP[t.fmt](obj)
+    if load(t.fmt, cur or "") != obj or not existed:
+        write_text(t.path, new, private)
     return entry
 
 
 def restore(entry: dict) -> None:
-    """Put the file back as it was before Ramen: byte-for-byte where Ramen owned the file or a block and nothing
-    else moved; else only Ramen's part goes, the user's later edits stay."""
-    path, merge = Path(entry.get("path", "")), entry.get("merge")
+    """Put the file back as it was before Ramen: byte-for-byte where nothing else moved since the write; else only
+    Ramen's part goes, the user's later edits stay. A file that only held Ramen's block gets its pre-block content."""
+    path, merge, fmt = Path(entry.get("path", "")), entry.get("merge"), entry.get("format", "json")
     cur = read_text(path)
     if cur is None:
         return
@@ -372,8 +434,10 @@ def restore(entry: dict) -> None:
     if merge == "replace":
         new = snapshot if existed else None
     elif merge == "block":
-        rest = without_block(cur, *(entry.get("owned") or markers(path, entry.get("group", ""))))
-        if existed and snapshot is not None and rest.rstrip("\n") == snapshot.rstrip("\n"):
+        owned = entry.get("owned") or markers(path, host_of(entry.get("target") or ""), entry.get("group", ""))
+        rest = without_block(cur, *owned)
+        same = rest.rstrip("\n") == (snapshot or "").rstrip("\n")
+        if existed and snapshot is not None and (same or not rest.strip()):
             new = snapshot
         else:
             new = rest if (existed or rest.strip()) else None
@@ -382,17 +446,28 @@ def restore(entry: dict) -> None:
         new = with_keys(cur, ours, restore=entry.get("prior") or {})
         new = new if (existed or new.strip()) else None
     else:
-        obj = load(entry.get("format", "json"), cur)
+        obj = load(fmt, cur)
         if obj is None:
             return
-        prior = entry.get("prior") or {}
+        prior, hooks = entry.get("prior") or {}, entry.get(HOOKS_KEY) or {}
         for p in entry.get("owned") or []:
             key = json.dumps(p)
-            if key in prior:
+            if key in hooks:
+                keys, have = set(hooks[key]), get_path(obj, p)
+                rest = [e for e in (have if isinstance(have, list) else []) if hook_key(e) not in keys]
+                back = [e for e in (prior.get(key) or []) if hook_key(e) in keys]
+                if rest or back:
+                    set_path(obj, p, rest + back)
+                else:
+                    del_path(obj, p)
+            elif key in prior:
                 set_path(obj, p, prior[key])
             else:
                 del_path(obj, p)
-        new = DUMP[entry.get("format", "json")](obj) if (existed or obj) else None
+        if existed and snapshot is not None and load(fmt, snapshot) == obj:
+            new = snapshot  # nothing else moved since the write: the user's bytes, not the dumper's
+        else:
+            new = DUMP[fmt](obj) if (existed or obj) else None
     if new is None:
         try:
             path.unlink()
@@ -467,6 +542,17 @@ def entries_of(ledger, pol: Policy) -> list[dict]:
     return [e for e in ledger.entries if e.get("kind") == KIND and all(e.get(k) == v for k, v in ident.items())]
 
 
+def entry_key(e: dict) -> tuple[str, str]:
+    """One ledger entry per (path, source): a repo fragment and the telemetry target may share a file (P4-B2)."""
+    return str(e.get("path", "")), str(e.get("source") or "repo")
+
+
+def restore_all(entries: list[dict]) -> None:
+    """Later writes first: a leaf two sources own gets the earlier source's value back, then the user's."""
+    for e in reversed(entries):
+        restore(e)
+
+
 def apply(pol: Policy, shell_rc: bool = True) -> list[dict]:
     """Write every target the bundle asks for (accepted repo configs; telemetry when required and a token is held);
     targets recorded earlier that are no longer asked for are restored. The entries written."""
@@ -475,7 +561,7 @@ def apply(pol: Policy, shell_rc: bool = True) -> list[dict]:
     if pol.target is None:
         return []
     ctx, ident, ledger = Ctx(pol), ident_of(pol), Ledger()
-    before = {e["path"]: e for e in entries_of(ledger, pol)}
+    before = {entry_key(e): e for e in entries_of(ledger, pol)}
     version = pol.configs_version() or ""
     targets = repo_targets(pol, ctx) if pol.configs_accepted() else []
     if pol.telemetry_required() and ctx.token:
@@ -485,15 +571,15 @@ def apply(pol: Policy, shell_rc: bool = True) -> list[dict]:
         if (why := t.valid()) is not None:
             say(f"ramen-mcp-bridge: configs target {t.path}: {why}; skipped")
             continue
-        e = apply_target(t, ctx, before.get(str(t.path)), ident, version)
+        e = apply_target(t, ctx, before.get((str(t.path), t.source)), ident, version)
         if e is not None:
-            ledger.upsert(e, ("kind", "target", "group", "zone", "path"))
+            ledger.upsert(e, ("kind", "target", "group", "zone", "path", "source"))
             done.append(e)
-    kept = {e["path"] for e in done}
-    for path, e in before.items():
-        if path not in kept:
-            restore(e)
-            ledger.entries.remove(e)
+    kept = {entry_key(e) for e in done}
+    gone = [e for k, e in before.items() if k not in kept]
+    restore_all(gone)
+    for e in gone:
+        ledger.entries.remove(e)
     ledger.save()
     return done
 
