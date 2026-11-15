@@ -127,6 +127,29 @@ config text) — Ramen 1.0.0c, CONTRACTS §29.3. The bridge keeps and enforces i
   2 when stale or missing (with the reconnect message), 1 when the console cannot be reached; `remove` reverts every
   ledger entry for that (host, group, zone) and deletes the bundle and the evals config.
 
+### SkillSpector scans (0.6.0)
+
+When a group turns on [NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector) (Ramen 1.0.0c Phase 2, CONTRACTS
+§30.3) the token answer also carries a `skillspector` object (`version`, `required`, `llm`, and the group's optional
+baseline). The bridge treats it like evals:
+
+- the bundle keeps `skillspector` (`version`, `required`, `llm`); the baseline text goes to
+  `~/.ramen/skillspector/<host>/<group>/baseline.yaml`;
+- every gated call carries `params._meta["io.ramen/skillspector"] = {"version": "<v>"}`; a worker answering
+  `-32027 skillspector policy required` / `skillspector policy changed: sign in again` (HTTP 428) makes the bridge sign
+  in again once and retry, exactly as for `-32026`; `policy check` compares `skillspector` too;
+- **the local scan.** When `skillspector.required` is set, `policy check` (so the Claude Code `SessionStart` hook) and
+  `policy show` run `skillspector scan <dir> --recursive --no-llm --format json` over the skill directories on this
+  machine — `~/.claude/skills`, `<cwd>/.claude/skills`, `~/.codex/skills`, those that exist and hold a skill (a
+  directory with exactly one skill and a bundle baseline is scanned on its own with `--baseline`). Any skill rated
+  `DO_NOT_INSTALL`, a scanner that fails, or no `skillspector` on PATH → the skills are named, then
+  `Ramen policy: fix or remove these skills — Ramen cannot be used with them`, exit **3** (missing binary: the hint
+  `uv tool install 'git+https://github.com/NVIDIA/SkillSpector.git@v2.13.4'`). `CAUTION` is printed and passes.
+  Results are cached per directory content hash in `~/.ramen/scans/<host>/` for 24 hours so hooks stay fast.
+  `--no-client-scan` (`RAMEN_BRIDGE_NO_CLIENT_SCAN=1`, on the bridge and on `policy check|show`) turns the local scan
+  off; the bundle and the version on every call stay. The Cursor rule and the Claude Code / VS Code entries say when
+  the requirement is set.
+
 **The honest limit.** The policy is enforced where Ramen is: the worker refuses a call that does not carry the current
 versions, and the bridge, the hook and the rule files make sure a client that goes through them learns it. An LLM
 that never uses the bridge or Ramen's workers cannot be forced by any of this; what it can be told is in its editor's
@@ -141,8 +164,8 @@ Point an MCP client at it directly:
 
 Every flag has a `RAMEN_BRIDGE_*` environment variable equivalent (`--target` → `RAMEN_BRIDGE_TARGET`,
 `--tls` → `RAMEN_BRIDGE_TLS=1`, `--group` → `RAMEN_BRIDGE_GROUP`, `--zone` → `RAMEN_BRIDGE_ZONE`,
-`--no-client-config` → `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1`) so the key
-never has to sit in a client's config file — `RAMEN_MCP_KEY` (or `RAMEN_BRIDGE_KEY`) is enough.
+`--no-client-config` → `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1`, `--no-client-scan` → `RAMEN_BRIDGE_NO_CLIENT_SCAN=1`) so
+the key never has to sit in a client's config file — `RAMEN_MCP_KEY` (or `RAMEN_BRIDGE_KEY`) is enough.
 `--health [SERVICE]` checks `grpc.health.v1` and exits 0 when SERVING, for a liveness probe.
 
 ## Develop

@@ -14,14 +14,14 @@ import os
 import sys
 import time
 from collections.abc import Iterator
-from typing import BinaryIO
+from typing import BinaryIO, ClassVar
 
 import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from ramen_proto.ramen.v1 import mcp_pb2, mcp_pb2_grpc
 
-from . import clients, oauth, policy
+from . import clients, oauth, policy, scan
 from . import telemetry as tel
 
 CODES = {
@@ -92,6 +92,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env("NO_CLIENT_CONFIG") in ("1", "true"),
         help="do not write the policy into Claude Code / Cursor / VS Code config files at sign-in "
         "(RAMEN_BRIDGE_NO_CLIENT_CONFIG=1)",
+    )
+    ap.add_argument(
+        "--no-client-scan",
+        action="store_true",
+        default=_env("NO_CLIENT_SCAN") in ("1", "true"),
+        help="the policy check does not run SkillSpector over the skills on this machine; the bundle and the version "
+        "on every call stay (RAMEN_BRIDGE_NO_CLIENT_SCAN=1)",
     )
     a = ap.parse_args(argv)
     if not a.target:
@@ -168,7 +175,8 @@ class Bridge:
         """`bearer` (0.2.0): a callable giving the current access token — `bearer(force=True)` after the worker
         said UNAUTHENTICATED, once per call; without it `metadata` carries the static key. `telemetry` (0.4.0): the
         vault holding the token answer's `telemetry` object plus the recorder of what the host did (§26.3). `pol`
-        (0.5.0): the policy bundle whose evals version rides on every gated call (§29.3)."""
+        (0.5.0): the policy bundle whose evals (§29.3) and skillspector (0.6.0, §30.3) versions ride on every gated
+        call."""
         self.stub, self.metadata, self.timeout, self.bearer = stub, metadata, timeout, bearer
         self.telemetry = telemetry or tel.Telemetry()
         self.policy = pol or policy.Policy()
@@ -211,14 +219,16 @@ class Bridge:
             return self.error_for(raw, e), False
 
     # --- 0.4.0: telemetry through Ramen (§26.3) ----------------------------------------------------------------
-    RETRY_CODES = (tel.REPORT_REQUIRED, tel.CONFIG_STALE, policy.EVALS_STALE)
+    RETRY_CODES = (tel.REPORT_REQUIRED, tel.CONFIG_STALE, policy.EVALS_STALE, policy.SKILLSPECTOR_STALE)
+    POLICY_KEY: ClassVar[dict] = {policy.EVALS_STALE: "evals", policy.SKILLSPECTOR_STALE: "skillspector"}
 
     def _attach(self, raw: bytes, msg: dict) -> bytes:
-        """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]` and the
-        evals version under `params._meta["io.ramen/evals"]` (0.5.0) — each when the bridge holds one; the body is
-        forwarded in the era the host spoke (the bridge does not upgrade eras)."""
-        version, evals = self.telemetry.version(), self.policy.evals_version()
-        if version is None and evals is None:
+        """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]`, the evals
+        version under `params._meta["io.ramen/evals"]` (0.5.0) and the skillspector version under
+        `params._meta["io.ramen/skillspector"]` (0.6.0) — each when the bridge holds one; the body is forwarded in
+        the era the host spoke (the bridge does not upgrade eras)."""
+        version, evals, ss = self.telemetry.version(), self.policy.evals_version(), self.policy.skillspector_version()
+        if version is None and evals is None and ss is None:
             return raw
         out = dict(msg)
         params = dict(out.get("params") or {})
@@ -227,6 +237,8 @@ class Bridge:
             meta[tel.META] = self.telemetry.recorder.take(version)
         if evals is not None:
             meta[policy.META] = {"version": evals}
+        if ss is not None:
+            meta[policy.SKILLSPECTOR_META] = {"version": ss}
         params["_meta"] = meta
         out["params"] = params
         return json.dumps(out).encode()
@@ -246,6 +258,7 @@ class Bridge:
             tel.CONFIG_STALE: "telemetry config changed",
             tel.REPORT_REQUIRED: "telemetry report required",
             policy.EVALS_STALE: "evals config required or changed",
+            policy.SKILLSPECTOR_STALE: "skillspector policy required or changed",
         }[code]
         print(json.dumps({"level": "info", "msg": f"{why}; signing in again and retrying once"}), file=sys.stderr)
         if self.bearer is not None:
@@ -258,9 +271,10 @@ class Bridge:
         named = ((_parse(reply) or {}).get("error", {}).get("data") or {}).get("version")
         if isinstance(named, str) and named:
             # a static key cannot sign in: go on under the version the worker named
-            if code == policy.EVALS_STALE and (self.bearer is None or self.policy.evals_version() is None):
-                self.policy.adopt_evals(named)
-            elif code != policy.EVALS_STALE and (self.bearer is None or self.telemetry.version() is None):
+            key = self.POLICY_KEY.get(code)
+            if key is not None and (self.bearer is None or self.policy.version_of(key) is None):
+                self.policy.adopt(key, named)
+            elif key is None and (self.bearer is None or self.telemetry.version() is None):
                 self.telemetry.adopt(named)
         reply, delivered = self._exchange(self._attach(raw, msg))
         if delivered and _error_code(_parse(reply)) not in self.RETRY_CODES:
@@ -399,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         pol.load()
         if not a.no_client_config:
             uvx = bridge_args(a)
-            pol.on_update = lambda p: clients.install(p, uvx)
+            pol.on_update = lambda p: clients.install(p, uvx, client_scan=not a.no_client_scan)
         client.policy = pol
         if pol.bundle is None and not can_sign_in(client, a):
             print(policy.MISSING, file=sys.stderr)
@@ -425,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
     return serve(Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout), sys.stdin.buffer, sys.stdout.buffer)
 
 
-# --- 0.5.0: `ramen-mcp-bridge policy show|check|remove` (§29.3) --------------------------------------------------
+# --- 0.5.0: `ramen-mcp-bridge policy show|check|remove` (§29.3; the local scan of §30.3 since 0.6.0) ------------
 def policy_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="ramen-mcp-bridge policy", description="the policy bundle kept at sign-in")
     ap.add_argument("action", choices=["show", "check", "remove"])
@@ -434,6 +448,12 @@ def policy_main(argv: list[str]) -> int:
     ap.add_argument("--zone", default=_env("ZONE"))
     ap.add_argument("--ca", default=_env("CA"), help="PEM CA bundle for the console (check)")
     ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument(
+        "--no-client-scan",
+        action="store_true",
+        default=_env("NO_CLIENT_SCAN") in ("1", "true"),
+        help="skip the SkillSpector scan of this machine's skills (show, check)",
+    )
     a = ap.parse_args(argv)
     pol = policy.find(a.target, a.group, a.zone)
     if pol is None:
@@ -445,7 +465,7 @@ def policy_main(argv: list[str]) -> int:
         return 2
     if a.action == "show":
         print(json.dumps(pol.bundle, indent=1))
-        return 0
+        return 0 if a.no_client_scan else scan.check(pol)
     if a.action == "remove":
         reverted = clients.remove(pol.target or "", pol.group, pol.zone)
         pol.remove_files()
@@ -465,7 +485,7 @@ def policy_main(argv: list[str]) -> int:
         print(policy.STALE + " (" + "; ".join(diff) + ")", file=sys.stderr)
         return 2
     print(f"Ramen policy up to date for {pol.group}/{pol.zone} on {pol.target}")
-    return 0
+    return 0 if a.no_client_scan else scan.check(pol)
 
 
 if __name__ == "__main__":

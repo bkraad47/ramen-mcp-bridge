@@ -1,10 +1,12 @@
-"""The policy bundle (bridge 0.5.0, CONTRACTS §29.3 client side).
+"""The policy bundle (bridge 0.5.0 / 0.6.0, CONTRACTS §29.3 and §30.3 client side).
 
-The token answer's `telemetry` and `evals` objects are the group's policy for this client. The bridge keeps them at
-`~/.ramen/policy/<host>/<group>-<zone>.json` (0600, dirs 0700) — minus the telemetry `headers`, which stay in the
-in-memory vault only (§26.3) — and the evals config text at `~/.ramen/evals/<host>/<group>/promptfooconfig.yaml`.
-Every gated call carries `_meta["io.ramen/evals"] = {"version": v}`; `-32026` means the worker wants a newer one.
-`HOME` decides where `~` is (tests point it at a temp dir).
+The token answer's `telemetry`, `evals` and `skillspector` objects are the group's policy for this client. The bridge
+keeps them at `~/.ramen/policy/<host>/<group>-<zone>.json` (0600, dirs 0700) — minus the telemetry `headers`, which
+stay in the in-memory vault only (§26.3) — the evals config text at
+`~/.ramen/evals/<host>/<group>/promptfooconfig.yaml` and the SkillSpector baseline at
+`~/.ramen/skillspector/<host>/<group>/baseline.yaml`. Every gated call carries
+`_meta["io.ramen/evals"]` and `_meta["io.ramen/skillspector"]` = `{"version": v}`; `-32026` / `-32027` mean the worker
+wants a newer one. `HOME` decides where `~` is (tests point it at a temp dir).
 """
 
 from __future__ import annotations
@@ -19,9 +21,12 @@ import urllib.request
 from pathlib import Path
 
 META = "io.ramen/evals"
+SKILLSPECTOR_META = "io.ramen/skillspector"
 EVALS_STALE = -32026  # missing or stale evals version: sign in again
+SKILLSPECTOR_STALE = -32027  # missing or stale skillspector policy version: sign in again
+KEYS = ("telemetry", "evals", "skillspector")
 MISSING = "Ramen policy missing: reconnect (sign in) — Ramen cannot be used without it"
-STALE = "Ramen policy stale: reconnect (sign in) — the group's telemetry or evals config changed"
+STALE = "Ramen policy stale: reconnect (sign in) — the group's telemetry, evals or skillspector config changed"
 EXIT_MISSING = 3
 
 
@@ -41,6 +46,10 @@ def bundle_path(target: str, group: str, zone: str) -> Path:
 
 def evals_path(target: str, group: str) -> Path:
     return home() / ".ramen" / "evals" / host_of(target) / group / "promptfooconfig.yaml"
+
+
+def baseline_path(target: str, group: str) -> Path:
+    return home() / ".ramen" / "skillspector" / host_of(target) / group / "baseline.yaml"
 
 
 def write_private(path: Path, text: str) -> None:
@@ -80,15 +89,30 @@ class Policy:
     def evals_file(self) -> Path | None:
         return evals_path(self.target, self.group) if self.target else None
 
+    @property
+    def baseline_file(self) -> Path | None:
+        return baseline_path(self.target, self.group) if self.target else None
+
     # --- what rides on calls -----------------------------------------------------------------------------------
-    def evals_version(self) -> str | None:
-        ev = (self.bundle or {}).get("evals") or {}
-        v = ev.get("version")
+    def version_of(self, key: str) -> str | None:
+        v = ((self.bundle or {}).get(key) or {}).get("version")
         return v if isinstance(v, str) and v else None
 
+    def evals_version(self) -> str | None:
+        return self.version_of("evals")
+
+    def skillspector_version(self) -> str | None:
+        return self.version_of("skillspector")
+
+    def skillspector_required(self) -> bool:
+        return bool(((self.bundle or {}).get("skillspector") or {}).get("required"))
+
+    def adopt(self, key: str, version: str) -> None:
+        """A worker named a version the bridge has no policy for and cannot sign in to get (a static key)."""
+        self.bundle = {**(self.bundle or {}), key: {**((self.bundle or {}).get(key) or {}), "version": version}}
+
     def adopt_evals(self, version: str) -> None:
-        """A worker named a version the bridge has no config for and cannot sign in to get (a static key)."""
-        self.bundle = {**(self.bundle or {}), "evals": {**((self.bundle or {}).get("evals") or {}), "version": version}}
+        self.adopt("evals", version)
 
     # --- persistence --------------------------------------------------------------------------------------------
     def load(self) -> dict | None:
@@ -101,10 +125,13 @@ class Policy:
         self.bundle = b if isinstance(b, dict) else None
         return self.bundle
 
-    def update(self, telemetry: dict | None, evals: dict | None) -> dict:
-        """After a sign-in (or refresh): keep the token answer's policy, write the bundle and the evals config."""
+    def update(self, telemetry: dict | None, evals: dict | None, skillspector: dict | None = None) -> dict:
+        """After a sign-in (or refresh): keep the token answer's policy, write the bundle, the evals config and the
+        SkillSpector baseline."""
         ev = dict(evals) if evals else None
         config = ev.pop("config", None) if ev else None
+        ss = dict(skillspector) if skillspector else None
+        baseline = ss.pop("baseline", None) if ss else None
         self.bundle = {
             "target": self.target,
             "group": self.group,
@@ -112,22 +139,24 @@ class Policy:
             "console": self.console,
             "telemetry": public_telemetry(telemetry),
             "evals": ev,
+            "skillspector": ss,
         }
         if self.path is not None:
             write_private(self.path, json.dumps(self.bundle, indent=1) + "\n")
-            if isinstance(config, str) and config:
-                write_private(self.evals_file, config)
-            else:
-                try:
-                    self.evals_file.unlink()
-                except OSError:
-                    pass
+            for path, text in ((self.evals_file, config), (self.baseline_file, baseline)):
+                if isinstance(text, str) and text:
+                    write_private(path, text)
+                else:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
         if self.on_update is not None:
             self.on_update(self)
         return self.bundle
 
     def remove_files(self) -> None:
-        for p in (self.path, self.evals_file):
+        for p in (self.path, self.evals_file, self.baseline_file):
             try:
                 if p is not None:
                     p.unlink()
@@ -152,7 +181,7 @@ class Policy:
     def compare(self, current: dict) -> list[str]:
         """What differs between the bundle and the console's current policy; empty = up to date."""
         out = []
-        for key in ("telemetry", "evals"):
+        for key in KEYS:
             mine, theirs = (self.bundle or {}).get(key) or {}, current.get(key) or {}
             if (mine.get("version") or None) != (theirs.get("version") or None):
                 out.append(f"{key} version {mine.get('version') or '-'} → {theirs.get('version') or '-'}")

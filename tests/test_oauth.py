@@ -28,6 +28,7 @@ class FakeAS:
         self.dead_refresh = False
         self.telemetry: dict | None = None  # 0.4.0: the `telemetry` object a token answer carries (§24.3/§26.3)
         self.evals: dict | None = None  # 0.5.0: the `evals` object (§29.3)
+        self.skillspector: dict | None = None  # 0.6.0: the `skillspector` object (§30.3)
         self.policy: dict | None = None  # 0.5.0: what `/.well-known/ramen-policy` answers; None = 404
         self.policy_queries: list[dict] = []
         outer = self
@@ -103,6 +104,8 @@ class FakeAS:
                     answer["telemetry"] = outer.telemetry
                 if outer.evals is not None:
                     answer["evals"] = outer.evals
+                if outer.skillspector is not None:
+                    answer["skillspector"] = outer.skillspector
                 return self._json(200, answer)
 
             def log_message(self, *_):

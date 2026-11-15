@@ -318,9 +318,10 @@ class Client:
         tokens = dict(tokens)
         telemetry = tokens.pop("telemetry", None) or None  # absent = telemetry off on the console
         evals = tokens.pop("evals", None) or None  # absent = the group repo carries no evals file
+        skillspector = tokens.pop("skillspector", None) or None  # 0.6.0: absent = no scan policy (§30.3)
         self.vault.seal(telemetry)
         if self.policy is not None:
-            self.policy.update(telemetry, evals)
+            self.policy.update(telemetry, evals, skillspector)
         tokens["expires_at"] = time.time() + float(tokens.get("expires_in") or 3600)
         self.tokens = tokens
         self.store.save(tokens)

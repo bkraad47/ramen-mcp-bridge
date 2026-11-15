@@ -22,6 +22,10 @@ from pathlib import Path
 from .policy import Policy, home, say, write_private
 
 MARK = "_ramen"
+SKILLSPECTOR_NOTE = (
+    "SkillSpector required: this hook scans the skills on this machine (~/.claude/skills, ./.claude/skills, "
+    "~/.codex/skills); a DO_NOT_INSTALL skill blocks Ramen until it is fixed or removed"
+)
 
 
 def vscode_user_dir() -> Path:
@@ -59,13 +63,14 @@ def _write_json(path: Path, obj: dict) -> None:
     os.replace(tmp, path)
 
 
-def check_command(target: str, group: str, zone: str) -> str:
-    return f"ramen-mcp-bridge policy check --target {target} --group {group} --zone {zone}"
+def check_command(target: str, group: str, zone: str, client_scan: bool = True) -> str:
+    base = f"ramen-mcp-bridge policy check --target {target} --group {group} --zone {zone}"
+    return base if client_scan else base + " --no-client-scan"
 
 
 def rule_text(pol: Policy, bridge_args: list[str]) -> str:
     b = pol.bundle or {}
-    tel, ev = b.get("telemetry") or {}, b.get("evals") or {}
+    tel, ev, ss = b.get("telemetry") or {}, b.get("evals") or {}, b.get("skillspector") or {}
     lines = [
         "---",
         f"description: Ramen policy for {pol.group}/{pol.zone} on {pol.target}",
@@ -80,9 +85,18 @@ def rule_text(pol: Policy, bridge_args: list[str]) -> str:
         f"- Evals: {'required' if ev.get('required') else 'not required'}"
         + (f" (config version `{ev.get('version')}`)" if ev.get("version") else "")
         + "; every Ramen call names this version.",
+        f"- SkillSpector: {'required' if ss.get('required') else 'not required'}"
+        + (f" (policy version `{ss.get('version')}`)" if ss.get("version") else "")
+        + (
+            "; `ramen-mcp-bridge policy check` scans the skills on this machine with NVIDIA SkillSpector "
+            "(`~/.claude/skills`, `./.claude/skills`, `~/.codex/skills`); a skill rated DO_NOT_INSTALL must be fixed "
+            "or removed before Ramen can be used (exit 3)."
+            if ss.get("required")
+            else "."
+        ),
         (
-            "- When a Ramen call answers `-32025` or `-32026` (config changed) or a check says the policy is stale "
-            "or missing, sign in again: run"
+            "- When a Ramen call answers `-32025`, `-32026` or `-32027` (config changed) or a check says the policy "
+            "is stale or missing, sign in again: run"
         ),
         "  `uvx " + " ".join(bridge_args) + "`",
         "  (or restart the Ramen MCP server in this editor) and approve in the browser.",
@@ -120,12 +134,13 @@ class Ledger:
                 pass
 
 
-def install(pol: Policy, bridge_args: list[str]) -> list[dict]:
+def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> list[dict]:
     """Write (or refresh) every client file for this (target, group, zone); the entries written."""
     target, group, zone = pol.target or "", pol.group, pol.zone
     ident = {"target": target, "group": group, "zone": zone}
     ledger = Ledger()
     done: list[dict] = []
+    note = {"_ramen_policy": SKILLSPECTOR_NOTE} if pol.skillspector_required() else {}
 
     claude = home() / ".claude"
     if claude.is_dir():
@@ -139,13 +154,14 @@ def install(pol: Policy, bridge_args: list[str]) -> list[dict]:
                 if settings.get("hooks") is None:
                     settings["hooks"] = hooks = {}
                 start = hooks.setdefault("SessionStart", [])
-                cmd = check_command(target, group, zone)
-                entry = {"matcher": "", "hooks": [{"type": "command", "command": cmd}], MARK: True}
-                if isinstance(start, list) and not any(_is_ours(e, cmd) for e in start):
-                    start.append(entry)
+                key = check_command(target, group, zone)
+                cmd = check_command(target, group, zone, client_scan)
+                entry = {"matcher": "", "hooks": [{"type": "command", "command": cmd}], MARK: True, **note}
+                if isinstance(start, list) and entry not in start:
+                    start[:] = [*(e for e in start if not _is_ours(e, key)), entry]
                     _write_json(path, settings)
                 if isinstance(start, list):
-                    done.append({"kind": "claude_code", "file": str(path), "key": cmd, **ident})
+                    done.append({"kind": "claude_code", "file": str(path), "key": key, **ident})
 
     cursor = home() / ".cursor"
     if cursor.is_dir():
@@ -167,7 +183,7 @@ def install(pol: Policy, bridge_args: list[str]) -> list[dict]:
             if isinstance(mcp, dict) and isinstance(mcp.get("servers", {}), dict):
                 servers = mcp.setdefault("servers", {})
                 key = f"ramen-{group}-{zone}"
-                entry = {"command": "uvx", "args": list(bridge_args), MARK: True}
+                entry = {"command": "uvx", "args": list(bridge_args), MARK: True, **note}
                 if servers.get(key) != entry:
                     servers[key] = entry
                     _write_json(path, settings)
@@ -182,9 +198,10 @@ def install(pol: Policy, bridge_args: list[str]) -> list[dict]:
 
 
 def _is_ours(entry, cmd: str) -> bool:
+    """Our hook for this (target, group, zone): the check command, with or without `--no-client-scan`."""
     if not isinstance(entry, dict):
         return False
-    return any(isinstance(h, dict) and h.get("command") == cmd for h in entry.get("hooks") or [])
+    return any(isinstance(h, dict) and str(h.get("command", "")).startswith(cmd) for h in entry.get("hooks") or [])
 
 
 def remove(target: str, group: str, zone: str) -> list[dict]:
