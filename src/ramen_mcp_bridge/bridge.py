@@ -21,7 +21,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from ramen_proto.ramen.v1 import mcp_pb2, mcp_pb2_grpc
 
-from . import clients, oauth, policy, scan
+from . import clients, configs, oauth, policy, scan
 from . import telemetry as tel
 
 CODES = {
@@ -99,6 +99,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env("NO_CLIENT_SCAN") in ("1", "true"),
         help="the policy check does not run SkillSpector over the skills on this machine; the bundle and the version "
         "on every call stay (RAMEN_BRIDGE_NO_CLIENT_SCAN=1)",
+    )
+    ap.add_argument(
+        "--no-shell-rc",
+        action="store_true",
+        default=_env("NO_SHELL_RC") in ("1", "true"),
+        help="do not add the `. ~/.ramen/env.sh` block to ~/.zshrc / ~/.bashrc when the group requires telemetry "
+        "(RAMEN_BRIDGE_NO_SHELL_RC=1)",
     )
     a = ap.parse_args(argv)
     if not a.target:
@@ -219,32 +226,76 @@ class Bridge:
             return self.error_for(raw, e), False
 
     # --- 0.4.0: telemetry through Ramen (§26.3) ----------------------------------------------------------------
-    RETRY_CODES = (tel.REPORT_REQUIRED, tel.CONFIG_STALE, policy.EVALS_STALE, policy.SKILLSPECTOR_STALE)
-    POLICY_KEY: ClassVar[dict] = {policy.EVALS_STALE: "evals", policy.SKILLSPECTOR_STALE: "skillspector"}
+    RETRY_CODES = (
+        tel.REPORT_REQUIRED,
+        tel.CONFIG_STALE,
+        policy.EVALS_STALE,
+        policy.SKILLSPECTOR_STALE,
+        policy.CONFIGS_STALE,
+    )
+    POLICY_KEY: ClassVar[dict] = {
+        policy.EVALS_STALE: "evals",
+        policy.SKILLSPECTOR_STALE: "skillspector",
+        policy.CONFIGS_STALE: "configs",
+    }
+    WHY: ClassVar[dict] = {
+        tel.CONFIG_STALE: "telemetry config changed",
+        tel.REPORT_REQUIRED: "telemetry report required",
+        policy.EVALS_STALE: "evals config required or changed",
+        policy.SKILLSPECTOR_STALE: "skillspector policy required or changed",
+        policy.CONFIGS_STALE: "configs required or changed",
+    }
 
     def _attach(self, raw: bytes, msg: dict) -> bytes:
-        """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]`, the evals
-        version under `params._meta["io.ramen/evals"]` (0.5.0) and the skillspector version under
-        `params._meta["io.ramen/skillspector"]` (0.6.0) — each when the bridge holds one; the body is forwarded in
-        the era the host spoke (the bridge does not upgrade eras)."""
-        version, evals, ss = self.telemetry.version(), self.policy.evals_version(), self.policy.skillspector_version()
-        if version is None and evals is None and ss is None:
+        """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]` and the
+        evals (0.5.0), skillspector and configs (0.6.0) versions under `params._meta["io.ramen/<key>"]` — each when
+        the bridge holds one; the body is forwarded in the era the host spoke (the bridge does not upgrade eras)."""
+        version = self.telemetry.version()
+        versions = {
+            policy.META: self.policy.evals_version(),
+            policy.SKILLSPECTOR_META: self.policy.skillspector_version(),
+            policy.CONFIGS_META: self.policy.configs_version(),
+        }
+        if version is None and not any(versions.values()):
             return raw
         out = dict(msg)
         params = dict(out.get("params") or {})
         meta = dict(params.get("_meta") or {})
         if version is not None:
             meta[tel.META] = self.telemetry.recorder.take(version)
-        if evals is not None:
-            meta[policy.META] = {"version": evals}
-        if ss is not None:
-            meta[policy.SKILLSPECTOR_META] = {"version": ss}
+        for key, v in versions.items():
+            if v is not None:
+                meta[key] = {"version": v}
         params["_meta"] = meta
         out["params"] = params
         return json.dumps(out).encode()
 
+    def _configs_in_place(self, raw: bytes) -> tuple[bool, bytes | None]:
+        """§31.3: a recorded configs or telemetry target that was removed or changed stops every gated call — after
+        one re-sign-in, which writes the files again — until it is back; the refusal names the files."""
+        broken = configs.verify(self.policy)
+        if broken and self.bearer is not None:
+            try:
+                self.bearer(force=True)
+            except oauth.OAuthError:
+                pass
+            broken = configs.verify(self.policy)
+        if not broken:
+            return False, None
+        line = {"level": "warn", "msg": configs.REMOVED, "paths": broken}
+        print(json.dumps(line, ensure_ascii=False), file=sys.stderr)
+        rid = (_parse(raw) or {}).get("id")
+        if rid is None:
+            return True, None
+        err = {"code": policy.CONFIGS_STALE, "message": configs.REMOVED, "data": {"paths": broken}}
+        return True, json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}).encode()
+
     def _gated(self, raw: bytes, msg: dict) -> bytes | None:
         rec = self.telemetry.recorder
+        if self.policy.target is not None:
+            refused, reply = self._configs_in_place(raw)
+            if refused:
+                return reply
         reply, delivered = self._exchange(self._attach(raw, msg))
         code = _error_code(_parse(reply)) if delivered else None
         if not delivered:
@@ -254,12 +305,7 @@ class Bridge:
             rec.commit()
             return reply
         rec.restore()
-        why = {
-            tel.CONFIG_STALE: "telemetry config changed",
-            tel.REPORT_REQUIRED: "telemetry report required",
-            policy.EVALS_STALE: "evals config required or changed",
-            policy.SKILLSPECTOR_STALE: "skillspector policy required or changed",
-        }[code]
+        why = self.WHY[code]
         print(json.dumps({"level": "info", "msg": f"{why}; signing in again and retrying once"}), file=sys.stderr)
         if self.bearer is not None:
             try:
@@ -413,7 +459,12 @@ def main(argv: list[str] | None = None) -> int:
         pol.load()
         if not a.no_client_config:
             uvx = bridge_args(a)
-            pol.on_update = lambda p: clients.install(p, uvx, client_scan=not a.no_client_scan)
+
+            def on_update(p: policy.Policy) -> None:
+                clients.install(p, uvx, client_scan=not a.no_client_scan)
+                configs.apply(p, shell_rc=not a.no_shell_rc)  # §31.3: the group's configs and telemetry targets
+
+            pol.on_update = on_update
         client.policy = pol
         if pol.bundle is None and not can_sign_in(client, a):
             print(policy.MISSING, file=sys.stderr)
@@ -465,14 +516,19 @@ def policy_main(argv: list[str]) -> int:
         return 2
     if a.action == "show":
         print(json.dumps(pol.bundle, indent=1))
+        for line in configs.show(pol):  # §31.3: every configs / telemetry target and whether it is still in place
+            print(line)
         return 0 if a.no_client_scan else scan.check(pol)
     if a.action == "remove":
         reverted = clients.remove(pol.target or "", pol.group, pol.zone)
         pol.remove_files()
         for e in reverted:
-            print(f"reverted {e['kind']}: {e['file']}" + (f" [{e['key']}]" if e.get("key") else ""), file=sys.stderr)
+            where = e.get("file") or e.get("path", "")
+            print(f"reverted {e['kind']}: {where}" + (f" [{e['key']}]" if e.get("key") else ""), file=sys.stderr)
         print(f"removed the policy bundle for {pol.group}/{pol.zone} on {pol.target}", file=sys.stderr)
         return 0
+    if (rc := configs.check(pol)) != 0:  # §31.3: the files first — offline, and the reason the hook exists
+        return rc
     import ssl
 
     try:

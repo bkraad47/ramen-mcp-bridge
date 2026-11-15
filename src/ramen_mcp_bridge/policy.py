@@ -4,9 +4,10 @@ The token answer's `telemetry`, `evals` and `skillspector` objects are the group
 keeps them at `~/.ramen/policy/<host>/<group>-<zone>.json` (0600, dirs 0700) — minus the telemetry `headers`, which
 stay in the in-memory vault only (§26.3) — the evals config text at
 `~/.ramen/evals/<host>/<group>/promptfooconfig.yaml` and the SkillSpector baseline at
-`~/.ramen/skillspector/<host>/<group>/baseline.yaml`. Every gated call carries
-`_meta["io.ramen/evals"]` and `_meta["io.ramen/skillspector"]` = `{"version": v}`; `-32026` / `-32027` mean the worker
-wants a newer one. `HOME` decides where `~` is (tests point it at a temp dir).
+`~/.ramen/skillspector/<host>/<group>/baseline.yaml` and the group's LLM configs (§31.3, manifest + files) at
+`~/.ramen/configs/<host>/<group>/`. Every gated call carries `_meta["io.ramen/evals"]`, `_meta["io.ramen/skillspector"]`
+and `_meta["io.ramen/configs"]` = `{"version": v}`; `-32026` / `-32027` / `-32028` mean the worker wants a newer one.
+`HOME` decides where `~` is (tests point it at a temp dir).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import urllib.error
 import urllib.parse
@@ -22,11 +24,13 @@ from pathlib import Path
 
 META = "io.ramen/evals"
 SKILLSPECTOR_META = "io.ramen/skillspector"
+CONFIGS_META = "io.ramen/configs"
 EVALS_STALE = -32026  # missing or stale evals version: sign in again
 SKILLSPECTOR_STALE = -32027  # missing or stale skillspector policy version: sign in again
-KEYS = ("telemetry", "evals", "skillspector")
+CONFIGS_STALE = -32028  # missing or stale configs version: sign in again (and accept)
+KEYS = ("telemetry", "evals", "skillspector", "configs")
 MISSING = "Ramen policy missing: reconnect (sign in) — Ramen cannot be used without it"
-STALE = "Ramen policy stale: reconnect (sign in) — the group's telemetry, evals or skillspector config changed"
+STALE = "Ramen policy stale: reconnect (sign in) — the group's telemetry, evals, skillspector or configs changed"
 EXIT_MISSING = 3
 
 
@@ -80,6 +84,9 @@ class Policy:
         self.target, self.group, self.zone, self.console = target, group, zone, console
         self.bundle: dict | None = None
         self.on_update = None
+        # §31.3: the access token and the person it names, held here for the files that carry them — never saved
+        self.token: str | None = None
+        self.user: str | None = None
 
     @property
     def path(self) -> Path | None:
@@ -92,6 +99,10 @@ class Policy:
     @property
     def baseline_file(self) -> Path | None:
         return baseline_path(self.target, self.group) if self.target else None
+
+    @property
+    def configs_dir(self) -> Path | None:
+        return home() / ".ramen" / "configs" / host_of(self.target) / self.group if self.target else None
 
     # --- what rides on calls -----------------------------------------------------------------------------------
     def version_of(self, key: str) -> str | None:
@@ -106,6 +117,24 @@ class Policy:
 
     def skillspector_required(self) -> bool:
         return bool(((self.bundle or {}).get("skillspector") or {}).get("required"))
+
+    def configs_version(self) -> str | None:
+        return self.version_of("configs")
+
+    def configs_accepted(self) -> bool:
+        return bool(((self.bundle or {}).get("configs") or {}).get("accepted"))
+
+    def configs_pending(self) -> bool:
+        """The group has configs this person has not accepted (§31.1): no call goes through until they do."""
+        return bool((self.bundle or {}).get("configs")) and not self.configs_accepted()
+
+    def telemetry_required(self) -> bool:
+        return bool(((self.bundle or {}).get("telemetry") or {}).get("required"))
+
+    def consent_url(self) -> str:
+        console = (self.console or (self.bundle or {}).get("console") or "").rstrip("/")
+        nxt = urllib.parse.quote(f"/groups/{self.group}", safe="/")
+        return f"{console}/groups/{urllib.parse.quote(self.group, safe='')}/configs?next={nxt}"
 
     def adopt(self, key: str, version: str) -> None:
         """A worker named a version the bridge has no policy for and cannot sign in to get (a static key)."""
@@ -125,13 +154,25 @@ class Policy:
         self.bundle = b if isinstance(b, dict) else None
         return self.bundle
 
-    def update(self, telemetry: dict | None, evals: dict | None, skillspector: dict | None = None) -> dict:
-        """After a sign-in (or refresh): keep the token answer's policy, write the bundle, the evals config and the
-        SkillSpector baseline."""
+    def update(
+        self,
+        telemetry: dict | None,
+        evals: dict | None,
+        skillspector: dict | None = None,
+        configs: dict | None = None,
+        token: str | None = None,
+        user: str | None = None,
+    ) -> dict:
+        """After a sign-in (or refresh): keep the token answer's policy, write the bundle, the evals config, the
+        SkillSpector baseline and the configs directory (manifest + files); the token stays in memory."""
         ev = dict(evals) if evals else None
         config = ev.pop("config", None) if ev else None
         ss = dict(skillspector) if skillspector else None
         baseline = ss.pop("baseline", None) if ss else None
+        cf = dict(configs) if configs else None
+        manifest = cf.pop("manifest", None) if cf else None
+        files = cf.pop("files", None) if cf else None
+        self.token, self.user = token, user
         self.bundle = {
             "target": self.target,
             "group": self.group,
@@ -140,6 +181,7 @@ class Policy:
             "telemetry": public_telemetry(telemetry),
             "evals": ev,
             "skillspector": ss,
+            "configs": cf,
         }
         if self.path is not None:
             write_private(self.path, json.dumps(self.bundle, indent=1) + "\n")
@@ -151,6 +193,12 @@ class Policy:
                         path.unlink()
                     except OSError:
                         pass
+            shutil.rmtree(self.configs_dir, ignore_errors=True)
+            if isinstance(manifest, str) and manifest:
+                write_private(self.configs_dir / "manifest.yaml", manifest)
+                for name, text in (files or {}).items() if isinstance(files, dict) else ():
+                    if isinstance(text, str) and Path(name).name == name and name != "manifest.yaml":
+                        write_private(self.configs_dir / name, text)
         if self.on_update is not None:
             self.on_update(self)
         return self.bundle
@@ -162,6 +210,8 @@ class Policy:
                     p.unlink()
             except OSError:
                 pass
+        if self.configs_dir is not None:
+            shutil.rmtree(self.configs_dir, ignore_errors=True)
         self.bundle = None
 
     # --- the offline check against /.well-known/ramen-policy ----------------------------------------------------

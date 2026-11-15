@@ -119,6 +119,12 @@ class Ledger:
         if entry not in self.entries:
             self.entries.append(entry)
 
+    def upsert(self, entry: dict, keys: tuple) -> None:
+        """Replace the one entry sharing `keys` with this one (a configs target written again), else append."""
+        ident = tuple(entry.get(k) for k in keys)
+        self.entries = [e for e in self.entries if tuple(e.get(k) for k in keys) != ident]
+        self.entries.append(entry)
+
     def take(self, target: str, group: str, zone: str) -> list[dict]:
         mine = [e for e in self.entries if (e.get("target"), e.get("group"), e.get("zone")) == (target, group, zone)]
         self.entries = [e for e in self.entries if e not in mine]
@@ -206,11 +212,16 @@ def _is_ours(entry, cmd: str) -> bool:
 
 def remove(target: str, group: str, zone: str) -> list[dict]:
     """Revert every ledger entry of this (target, group, zone); the entries reverted."""
+    from . import configs
+
     ledger = Ledger()
     mine = ledger.take(target, group, zone)
     for e in mine:
         path = Path(e.get("file", ""))
         kind, key = e.get("kind"), e.get("key", "")
+        if kind == configs.KIND:  # §31.3: a configs or telemetry target, put back as it was
+            configs.restore(e)
+            continue
         if kind == "cursor":
             try:
                 path.unlink()

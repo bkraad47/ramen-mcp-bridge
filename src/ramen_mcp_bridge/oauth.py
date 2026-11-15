@@ -184,18 +184,21 @@ class Client:
         listen: tuple[str, int] = ("127.0.0.1", 0),
         ca: str | None = None,
         idle_secs: float = 1800.0,
+        consent_poll: float = 3.0,
     ):
         """`store` (0.3.0): where tokens rest — `MemoryStore` (default, nothing on disk), `KeychainStore` (the OS
         secret store) or `TokenFile` (a plain 0600 file; opt-in, for automation). `idle_secs`: tokens are forgotten
         this long after the last call (default thirty minutes; 0 keeps them for the console's own lifetimes), and the
-        next call needs a fresh sign-in."""
+        next call needs a fresh sign-in. `consent_poll` (0.6.0): how often the token answer is asked again while the
+        person accepts the group's configs in the browser (§31.3)."""
         self.console, self.client_id, self.scope = console.rstrip("/"), client_id, scope
         self.store = store if store is not None else MemoryStore()
         self.opener = opener or webbrowser.open
         self.timeout, self.login_timeout, self.listen = timeout, login_timeout, listen
-        self.idle_secs = idle_secs
+        self.idle_secs, self.consent_poll = idle_secs, consent_poll
         self.last_used = time.time()
         self.pending_url: str | None = None
+        self.pending_consent: str | None = None
         self._login_thread: threading.Thread | None = None
         self._login_error: Exception | None = None
         self.tokens: dict | None = self.store.load()
@@ -319,9 +322,13 @@ class Client:
         telemetry = tokens.pop("telemetry", None) or None  # absent = telemetry off on the console
         evals = tokens.pop("evals", None) or None  # absent = the group repo carries no evals file
         skillspector = tokens.pop("skillspector", None) or None  # 0.6.0: absent = no scan policy (§30.3)
+        configs = tokens.pop("configs", None) or None  # 0.6.0: absent = the repo has no mcp/llm-config/ (§31.3)
         self.vault.seal(telemetry)
         if self.policy is not None:
-            self.policy.update(telemetry, evals, skillspector)
+            from .configs import user_of
+
+            access = tokens.get("access_token")
+            self.policy.update(telemetry, evals, skillspector, configs, token=access, user=user_of(access))
         tokens["expires_at"] = time.time() + float(tokens.get("expires_in") or 3600)
         self.tokens = tokens
         self.store.save(tokens)
@@ -346,15 +353,40 @@ class Client:
         self.last_used = now
         t = self.tokens or {}
         if not force and t.get("access_token") and t.get("expires_at", 0) - EARLY > now:
-            return t["access_token"]
+            return self._accepted(t["access_token"], nonblocking)
         if t.get("refresh_token"):
             try:
-                return self.refresh()["access_token"]
+                return self._accepted(self.refresh()["access_token"], nonblocking)
             except OAuthError as e:
+                if self.policy is not None and self.policy.configs_pending():
+                    raise
                 self.forget(f"refresh failed ({e})")
         if not nonblocking:
-            return self.login()["access_token"]
+            return self._accepted(self.login()["access_token"], nonblocking)
         return self._login_in_background()
+
+    def _accepted(self, access: str, nonblocking: bool) -> str:
+        """§31.3: a token answer whose `configs.accepted` is false opens the console's configs page (as the sign-in
+        opens its page) and, unless the bridge is serving, waits for the acceptance by asking for the token again;
+        while serving the client is told the URL instead (`SignInRequired`)."""
+        if self.policy is None or not self.policy.configs_pending():
+            self.pending_consent = None
+            return access
+        url = self.policy.consent_url()
+        if self.pending_consent != url:
+            self.pending_consent = url
+            print(f"ramen-mcp-bridge: accept the group's configs at {url}", file=sys.stderr)
+            self.opener(url)
+        if nonblocking:
+            raise SignInRequired(url)
+        deadline = time.time() + self.login_timeout
+        while time.time() < deadline:
+            time.sleep(self.consent_poll)
+            access = self.refresh()["access_token"]
+            if not self.policy.configs_pending():
+                self.pending_consent = None
+                return access
+        raise OAuthError(f"the group's configs were not accepted within {int(self.login_timeout)} s: open {url}")
 
     def _login_in_background(self) -> str:
         th = self._login_thread
@@ -364,7 +396,7 @@ class Client:
                 err, self._login_error = self._login_error, None
                 raise err
             if self.tokens and self.tokens.get("access_token"):
-                return self.tokens["access_token"]
+                return self._accepted(self.tokens["access_token"], True)
         if self._login_thread is None:
             self.pending_url = None
 

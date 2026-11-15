@@ -150,6 +150,50 @@ baseline). The bridge treats it like evals:
   off; the bundle and the version on every call stay. The Cursor rule and the Claude Code / VS Code entries say when
   the requirement is set.
 
+### Group configs and telemetry (0.6.0)
+
+A group repo with `mcp/llm-config/` (Ramen 1.0.0c Phase 3, CONTRACTS §31) ships the LLM configs every member's tools
+start from: a `manifest.yaml` (`targets: [{client, file, path, format, merge}]`) and the fragments it names. The token
+answer carries them as `configs` (`version`, `required`, `accepted`, the manifest, the files) and the bridge applies
+them:
+
+- **Acceptance first.** Each person accepts a configs version once, in the browser. When the token answer says
+  `accepted: false` the bridge opens `https://<console>/groups/<g>/configs?next=…` the way it opens the sign-in page
+  (`--no-browser`: the link is printed), asks for the token again every few seconds and goes on once the console says
+  accepted (five minutes, then a clear message and exit). While the bridge is serving, a pending acceptance is reported
+  to the client as `-32001` with the link, never a hang. The manifest and files rest at
+  `~/.ramen/configs/<host>/<group>/` (0600); the bundle keeps `version`, `required`, `accepted`.
+- **Every target written.** `path` expands `~`, `{group}`, `{zone}`, `{host}`; a fragment may use
+  `${RAMEN_OTLP_ENDPOINT}`, `${RAMEN_OTLP_HEADERS}`, `${RAMEN_USER}`, `${RAMEN_GROUP}`, `${RAMEN_HOST}`, filled at
+  write time (the token never leaves this machine). `format: json | toml | yaml` with `merge: deep` sets Ramen's keys
+  and leaves yours alone; `text` with `merge: block` keeps one `# ramen:<group>` … `# /ramen` block (in `.md` files
+  `<!-- ramen:<group> -->` … `<!-- /ramen -->`), replaced in place; `env` with `merge: keys` replaces `KEY=value`
+  lines by key and appends the rest; `merge: replace` makes the whole file Ramen's. Writes are idempotent; a JSON /
+  TOML / YAML file the bridge cannot parse is left alone with a note.
+- **Telemetry targets** (built in, written when the group requires telemetry): Claude Code's `~/.claude/settings.json`
+  gets `env` with `CLAUDE_CODE_ENABLE_TELEMETRY=1`, the three `OTEL_*_EXPORTER=otlp`,
+  `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, `OTEL_EXPORTER_OTLP_ENDPOINT=https://<console>/otlp`,
+  `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <your token>` and
+  `OTEL_RESOURCE_ATTRIBUTES=ramen.group=<g>,ramen.user=<email>,ramen.host=<host>`; the same `OTEL_*` as `export`
+  lines in `~/.ramen/env.sh` (0600) for Codex, Gemini CLI, the OTel SDKs and harnesses; a
+  `[ -f ~/.ramen/env.sh ] && . ~/.ramen/env.sh` block in `~/.zshrc` and `~/.bashrc` where they exist
+  (`--no-shell-rc` / `RAMEN_BRIDGE_NO_SHELL_RC=1` skips it); and, when `~/.codex` exists, Codex's
+  `~/.codex/config.toml` `[otel] exporter = { otlp-http = { endpoint, protocol = "binary", headers } }`. The token in
+  these files is the bridge's current access token: every refresh rewrites them, `policy remove` strips them. Tokens
+  never appear on stderr or in the ledger.
+- **Ledger and checks.** `~/.ramen/clients.json` records every write (path, format, merge, version, the sha256 of the
+  ramen-owned part, the pre-ramen snapshot). `policy check` verifies each recorded target still holds its block / keys
+  and the telemetry env where written; anything missing → exit **3**,
+  `Ramen configs removed or changed: reconnect (sign in) — Ramen cannot be used without them`. The running bridge
+  makes the same check before every gated call: a missing target triggers one re-sign-in (which writes the files
+  again); still missing, the call is refused with that message and the paths. `policy show` lists every target and
+  whether it is in place; `policy remove` puts files back byte-for-byte where Ramen owned the file or a block and
+  nothing else changed, removes Ramen's keys (restoring your prior values) where it merged, and deletes files it
+  created.
+- **On every call** `params._meta["io.ramen/configs"] = {"version": "<v>"}` rides with the other versions; a worker
+  answering `-32028 configs required` / `configs changed: sign in again` (HTTP 428) makes the bridge sign in again
+  once and retry — and a new version means a new acceptance.
+
 **The honest limit.** The policy is enforced where Ramen is: the worker refuses a call that does not carry the current
 versions, and the bridge, the hook and the rule files make sure a client that goes through them learns it. An LLM
 that never uses the bridge or Ramen's workers cannot be forced by any of this; what it can be told is in its editor's
@@ -164,7 +208,8 @@ Point an MCP client at it directly:
 
 Every flag has a `RAMEN_BRIDGE_*` environment variable equivalent (`--target` → `RAMEN_BRIDGE_TARGET`,
 `--tls` → `RAMEN_BRIDGE_TLS=1`, `--group` → `RAMEN_BRIDGE_GROUP`, `--zone` → `RAMEN_BRIDGE_ZONE`,
-`--no-client-config` → `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1`, `--no-client-scan` → `RAMEN_BRIDGE_NO_CLIENT_SCAN=1`) so
+`--no-client-config` → `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1`, `--no-client-scan` → `RAMEN_BRIDGE_NO_CLIENT_SCAN=1`,
+`--no-shell-rc` → `RAMEN_BRIDGE_NO_SHELL_RC=1`) so
 the key never has to sit in a client's config file — `RAMEN_MCP_KEY` (or `RAMEN_BRIDGE_KEY`) is enough.
 `--health [SERVICE]` checks `grpc.health.v1` and exits 0 when SERVING, for a liveness probe.
 
