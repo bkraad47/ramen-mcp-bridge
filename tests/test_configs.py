@@ -42,7 +42,7 @@ FILES = {
     "notes.txt": "line from ramen\n",
 }
 CF = {"version": "cf0123456789", "required": True, "accepted": True, "manifest": MANIFEST, "files": FILES}
-TOKEN = "tok-s3cr3t-9f8e7d"
+TOKEN = "test-token-not-real"
 TEL = {"version": "t1", "required": True, "headers": {"k": "v"}, "otlp_endpoint": "http://col:4318"}
 
 
