@@ -25,6 +25,8 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
         self.hook = None  # 0.4.0 tests: (msg, md) -> error dict | None, a gate in front of the methods
         self.next_cursor: str | None = None
         self.delay = 0.0
+        self.skills: list[dict] | None = None  # §33.2: `skills/list` answer; None = method not found
+        self.skill_files: dict[str, dict] = {}  # `skill://…` uri → resources/read content ({"text"} | {"blob"})
 
     def Call(self, request, context):
         import time
@@ -70,6 +72,11 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
             result["nextCursor"] = self.next_cursor
         if method in ("prompts/get", "resources/read"):
             result = {"messages": []} if method == "prompts/get" else {"contents": []}
+            uri = (msg.get("params") or {}).get("uri")
+            if method == "resources/read" and uri in self.skill_files:
+                result = {"contents": [{"uri": uri, "mimeType": "text/plain", **self.skill_files[uri]}]}
+        if method == "skills/list" and self.skills is not None:
+            result = {"skills": self.skills}
         if method == "tools/call":
             args = msg["params"]["arguments"]
             result = {"content": [{"type": "text", "text": str(args["a"] + args["b"])}], "isError": False}

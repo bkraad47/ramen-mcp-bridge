@@ -194,6 +194,30 @@ them:
   answering `-32028 configs required` / `configs changed: sign in again` (HTTP 428) makes the bridge sign in again
   once and retry — and a new version means a new acceptance.
 
+### Skills over MCP (0.6.0)
+
+A group repo's `mcp/skills/<name>/` (`SKILL.md` + files) is served by Ramen as the skill `<name>` (Ramen 1.0.0c
+Phase 7, CONTRACTS §33.2): `skills/list` names them (`name`, `description`, `version` = sha12 of the directory,
+`files`), `resources/read` of `skill://<name>/<file>` hands each file out, gated like a tool (`skills:<name>` in the
+group's tool access). The bridge installs them for you; the connection flags are the bridge's own:
+
+```sh
+ramen-mcp-bridge skills list --target <host>:443 --tls --oauth https://<console> --client-id <id> --group demo --zone a
+ramen-mcp-bridge skills install iris-analyst [--dir ~/.claude/skills] --target … --key rmk_… --group demo --zone a
+```
+
+- `list` prints one line per skill (`name`, `version`, file count, description).
+- `install <name>` reads every file through the bridge's normal path (policy versions on the call, one re-sign-in on
+  a stale policy) and writes them under `<dir>/<name>/` (default `~/.claude/skills`): files `0644`, at most 256 KiB
+  each, a path that is absolute or steps out of the skill (`..`) refuses the whole install, nothing is written until
+  every file arrived. When the group's policy says `skillspector.required`, the staged skill is scanned first (as
+  `policy check` scans your skills): `DO_NOT_INSTALL`, a failed scan or no `skillspector` on PATH leaves nothing
+  behind and exits **3** with `Ramen policy: fix or remove these skills — Ramen cannot be used with them`; `CAUTION`
+  is printed and the skill installed. A directory of that name Ramen did not write is left alone (exit 1); one it
+  wrote is replaced.
+- Every file lands in the ledger `~/.ramen/clients.json` (kind `skill`); `policy remove` deletes them and the
+  directories they leave empty.
+
 **The honest limit.** The policy is enforced where Ramen is: the worker refuses a call that does not carry the current
 versions, and the bridge, the hook and the rule files make sure a client that goes through them learns it. An LLM
 that never uses the bridge or Ramen's workers cannot be forced by any of this; what it can be told is in its editor's

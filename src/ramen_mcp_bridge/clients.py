@@ -222,6 +222,11 @@ def remove(target: str, group: str, zone: str) -> list[dict]:
         if kind == configs.KIND:  # §31.3: a configs or telemetry target, put back as it was
             configs.restore(e)
             continue
+        if kind == "skill":  # §33.2: a file `skills install` wrote
+            from . import skills
+
+            skills.remove_file(e)
+            continue
         if kind == "cursor":
             try:
                 path.unlink()

@@ -14,6 +14,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import BinaryIO, ClassVar
 
 import grpc
@@ -21,7 +22,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from ramen_proto.ramen.v1 import mcp_pb2, mcp_pb2_grpc
 
-from . import clients, configs, oauth, policy, scan
+from . import clients, configs, oauth, policy, scan, skills
 from . import telemetry as tel
 
 CODES = {
@@ -437,10 +438,18 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     if argv[:1] == ["policy"]:
         return policy_main(argv[1:])
+    if argv[:1] == ["skills"]:
+        return skills_main(argv[1:])
     a = parse_args(argv)
     ch = channel(a)
     if a.health is not None:
         return health(ch, a.health, a.timeout)
+    b = connect(a, ch)
+    return b if isinstance(b, int) else serve(b, sys.stdin.buffer, sys.stdout.buffer)
+
+
+def connect(a: argparse.Namespace, ch: grpc.Channel) -> "Bridge | int":
+    """The bridge for these flags, signed in when `--oauth`; an exit code when the sign-in cannot happen."""
     md = [(k, v) for k, v in (("ramen-group", a.group), ("ramen-zone", a.zone)) if v]
     if a.oauth:
         opener = (lambda url: None) if a.no_browser else None
@@ -482,12 +491,50 @@ def main(argv: list[str] | None = None) -> int:
         def bearer(force: bool = False) -> str:
             return client.bearer(force=force, nonblocking=True)
 
-        b = Bridge(
+        return Bridge(
             mcp_pb2_grpc.McpStub(ch), md, a.timeout, bearer=bearer, telemetry=tel.Telemetry(client.vault), pol=pol
         )
-        return serve(b, sys.stdin.buffer, sys.stdout.buffer)
     md = [("authorization", f"Bearer {a.key}"), *md]
-    return serve(Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout), sys.stdin.buffer, sys.stdout.buffer)
+    return Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout)
+
+
+# --- 0.6.0: `ramen-mcp-bridge skills list|install <name>` (§33.2) --------------------------------------------------
+def skills_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="ramen-mcp-bridge skills",
+        description="list the group's skills (skills/list) or install one under your skills directory; "
+        "the connection flags are the bridge's (--target, --key or --oauth …)",
+    )
+    ap.add_argument("action", choices=["list", "install"], help="list, or install <name>")
+    ap.add_argument("--dir", default=None, help="skills directory (default ~/.claude/skills)")
+    # the leading words are ours (`install <name>`); every option but --dir is the bridge's
+    words, rest = [], list(argv)
+    while rest and not rest[0].startswith("-") and len(words) < 2:
+        words.append(rest.pop(0))
+    s, rest = ap.parse_known_args([words[0]] + rest if words else rest)
+    s.name = words[1] if len(words) > 1 else None
+    if s.action == "install" and not s.name:
+        ap.error("install needs the skill's name")
+    a = parse_args(rest)
+    b = connect(a, channel(a))
+    if isinstance(b, int):
+        return b
+    try:
+        if s.action == "list":
+            for sk in skills.list_skills(b):
+                files = sk.get("files") if isinstance(sk.get("files"), list) else []
+                print(f"{sk['name']}\t{sk.get('version') or '-'}\t{len(files)} files\t{sk.get('description') or ''}")
+            return 0
+        dest = Path(s.dir).expanduser() if s.dir else skills.default_dir()
+        for p in skills.install(b, b.policy, s.name, dest, a.target, a.group, a.zone):
+            print(f"wrote {p}", file=sys.stderr)
+        print(f"installed skill {s.name} under {dest / s.name}", file=sys.stderr)
+        return 0
+    except skills.SkillError as e:
+        print(f"ramen-mcp-bridge skills {s.action}: {e}", file=sys.stderr)
+        if e.code == skills.EXIT_BLOCK:
+            print(scan.BLOCK, file=sys.stderr)
+        return e.code
 
 
 # --- 0.5.0: `ramen-mcp-bridge policy show|check|remove` (§29.3; the local scan of §30.3 since 0.6.0) ------------
