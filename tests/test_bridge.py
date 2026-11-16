@@ -27,6 +27,7 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
         self.delay = 0.0
         self.skills: list[dict] | None = None  # §33.2: `skills/list` answer; None = method not found
         self.skill_files: dict[str, dict] = {}  # `skill://…` uri → resources/read content ({"text"} | {"blob"})
+        self.tool_results: dict[str, dict] = {}  # §36.3 tests: a tools/call result by tool name (else a+b)
 
     def Call(self, request, context):
         import time
@@ -77,7 +78,9 @@ class FakeMcp(mcp_pb2_grpc.McpServicer):
                 result = {"contents": [{"uri": uri, "mimeType": "text/plain", **self.skill_files[uri]}]}
         if method == "skills/list" and self.skills is not None:
             result = {"skills": self.skills}
-        if method == "tools/call":
+        if method == "tools/call" and msg["params"].get("name") in self.tool_results:
+            result = self.tool_results[msg["params"]["name"]]
+        elif method == "tools/call":
             args = msg["params"]["arguments"]
             result = {"content": [{"type": "text", "text": str(args["a"] + args["b"])}], "isError": False}
         if result is None:

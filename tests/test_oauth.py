@@ -30,6 +30,7 @@ class FakeAS:
         self.evals: dict | None = None  # 0.5.0: the `evals` object (§29.3)
         self.skillspector: dict | None = None  # 0.6.0: the `skillspector` object (§30.3)
         self.configs: dict | None = None  # 0.6.0: the `configs` object (§31.1)
+        self.guardrails: dict | None = None  # 0.6.0: the `guardrails` object (§36.3)
         self.policy: dict | None = None  # 0.5.0: what `/.well-known/ramen-policy` answers; None = 404
         self.policy_queries: list[dict] = []
         outer = self
@@ -109,6 +110,8 @@ class FakeAS:
                     answer["skillspector"] = outer.skillspector
                 if outer.configs is not None:
                     answer["configs"] = outer.configs
+                if outer.guardrails is not None:
+                    answer["guardrails"] = outer.guardrails
                 return self._json(200, answer)
 
             def log_message(self, *_):

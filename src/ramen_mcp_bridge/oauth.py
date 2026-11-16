@@ -323,12 +323,15 @@ class Client:
         evals = tokens.pop("evals", None) or None  # absent = the group repo carries no evals file
         skillspector = tokens.pop("skillspector", None) or None  # 0.6.0: absent = no scan policy (§30.3)
         configs = tokens.pop("configs", None) or None  # 0.6.0: absent = the repo has no mcp/llm-config/ (§31.3)
+        guardrails = tokens.pop("guardrails", None) or None  # 0.6.0: absent = no mcp/guardrails.yaml (§36.3)
         self.vault.seal(telemetry)
         if self.policy is not None:
             from .configs import user_of
 
             access = tokens.get("access_token")
-            self.policy.update(telemetry, evals, skillspector, configs, token=access, user=user_of(access))
+            self.policy.update(
+                telemetry, evals, skillspector, configs, token=access, user=user_of(access), guardrails=guardrails
+            )
         tokens["expires_at"] = time.time() + float(tokens.get("expires_in") or 3600)
         self.tokens = tokens
         self.store.save(tokens)

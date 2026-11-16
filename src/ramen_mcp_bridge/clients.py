@@ -32,6 +32,27 @@ SKILLSPECTOR_NOTE = (
 )
 
 
+def guardrails_note(pol: Policy) -> str | None:
+    """§36.3: the rails in force, for the client files (the group's pack runs on the worker and, when the nemo extra
+    is installed and `policy rails` is on, on this machine before and after every gated tool call)."""
+    gr = (pol.bundle or {}).get("guardrails") or {}
+    if not gr:
+        return None
+    where = "on the worker and locally in the bridge" if pol.rails_enabled() and gr.get("sha") else "on the worker"
+    req = "required" if gr.get("required") else "in force"
+    v = f" (policy version `{gr.get('version')}`)" if gr.get("version") else ""
+    return (
+        f"Guardrails {req}{v}: the group's NeMo rails run {where} on every gated tool call; a blocked call or result "
+        "comes back as an isError tool result with _meta.ramen.guardrail (stage, rail, where) — do not retry it "
+        "reworded to get around the rail"
+    )
+
+
+def policy_note(pol: Policy) -> dict:
+    notes = [n for n in ((SKILLSPECTOR_NOTE if pol.skillspector_required() else None), guardrails_note(pol)) if n]
+    return {"_ramen_policy": " · ".join(notes)} if notes else {}
+
+
 def vscode_user_dir() -> Path:
     if sys.platform == "darwin":
         return home() / "Library" / "Application Support" / "Code" / "User"
@@ -75,6 +96,7 @@ def check_command(target: str, group: str, zone: str, client_scan: bool = True) 
 def rule_text(pol: Policy, bridge_args: list[str]) -> str:
     b = pol.bundle or {}
     tel, ev, ss = b.get("telemetry") or {}, b.get("evals") or {}, b.get("skillspector") or {}
+    gr_note = guardrails_note(pol)
     lines = [
         "---",
         f"description: Ramen policy for {pol.group}/{pol.zone} on {pol.target}",
@@ -98,8 +120,10 @@ def rule_text(pol: Policy, bridge_args: list[str]) -> str:
             if ss.get("required")
             else "."
         ),
+        *([f"- {gr_note}."] if gr_note else []),
         (
-            "- When a Ramen call answers `-32025`, `-32026` or `-32027` (config changed) or a check says the policy "
+            "- When a Ramen call answers `-32025`, `-32026`, `-32027`, `-32028` or `-32029` (config changed) or a "
+            "check says the policy "
             "is stale or missing, sign in again: run"
         ),
         "  `uvx " + " ".join(bridge_args) + "`",
@@ -182,7 +206,7 @@ def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> li
     ident = {"target": target, "group": group, "zone": zone}
     ledger, token, host = Ledger(), pol.token or "", host_of(target)
     done: list[dict] = []
-    note = {"_ramen_policy": SKILLSPECTOR_NOTE} if pol.skillspector_required() else {}
+    note = policy_note(pol)
 
     claude = home() / ".claude"
     if claude.is_dir():

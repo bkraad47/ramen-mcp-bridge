@@ -209,6 +209,49 @@ them:
   answering `-32028 configs required` / `configs changed: sign in again` (HTTP 428) makes the bridge sign in again
   once and retry — and a new version means a new acceptance.
 
+### Guardrails policy and local rails (0.6.0)
+
+A group repo with `mcp/guardrails.yaml` (+ `mcp/guardrails/`, Ramen 0.7.5 §21.2, LLM rails since 1.0.0c §36) makes
+its rails a client policy too (CONTRACTS §36.3). The token answer carries `guardrails`:
+`{version, required, config, client_llm?}` — `config` is the pack (`guardrails.yaml` + `guardrails/**`) as a base64
+gzip tar of at most 64 KiB, `client_llm` is `{provider, model, api_key?, base_url?, endpoint?, deployment?}`, the
+LLM credential the group's or the org's provider gives this client for its rails. Every sign-in path hands it out and
+the worker gate holds for every caller; the bridge:
+
+- keeps `guardrails` (`version`, `required`, the content hash of the unpacked pack) in the bundle and unpacks the pack
+  to `~/.ramen/guardrails/<host>/<group>/` (0700 / 0600; a pack with absolute paths, `..`, links or more than 64 KiB
+  is refused). **`client_llm` stays in memory** — never on disk, never in the bundle, never on stderr.
+- carries `params._meta["io.ramen/guardrails"] = {"version": "<v>"}` on every gated call; a worker answering
+  `-32029 guardrails policy required` / `guardrails policy changed: sign in again` (HTTP 428) makes the bridge sign in
+  again once and retry, as for `-32026` … `-32028`; a static key adopts the version the worker names.
+- `policy check` (so the Claude Code `SessionStart` hook) verifies the unpacked pack still hashes as at sign-in and
+  compares `guardrails` with `/.well-known/ramen-policy`; the running bridge makes the same check before every gated
+  call (one re-sign-in puts the pack back, else the call is refused with
+  `Ramen configs removed or changed: reconnect (sign in) — Ramen cannot be used without them`). `policy show` lists
+  the pack and whether the local rails run; `policy remove` deletes it. The Cursor rule, the Claude Code hook and the
+  VS Code entry state the rails in force.
+- **runs the same rails locally** when installed with the extra — `uv tool install 'ramen-mcp-bridge[nemo]'` (or
+  `uvx 'ramen-mcp-bridge[nemo]@latest' …`; NeMo Guardrails 0.24 wants Python 3.10–3.13, so add `--python 3.12` on a
+  newer interpreter). Before a `tools/call` leaves, the tool's **input** rails run over the JSON arguments; when the
+  result comes back, its **output** rails run over the result text (`structuredContent` when present). The rails are
+  the worker's: the pack's own Colang flows, plus the LLM rails the yaml names per tool (`pre: [self_check_input,
+  jailbreak_detection, {topical: {topics: [...]}}, sensitive_data]`, `post: [self_check_output, hallucination,
+  fact_checking, sensitive_data]`), built exactly as the worker builds them (wrapper flows `ramen rail <name>`, the same
+  prompts unless the pack's `prompts.yml` defines the task) with `models:` filled from `client_llm` through NeMo's
+  OpenAI-compatible client (`openai`, `openai_compatible` + `base_url`, `azure` + `endpoint` + `deployment`,
+  `anthropic`, `vertex` and `bedrock` with an API key; `vertex` / `bedrock` without one need a cloud login the bridge
+  does not hold, so those LLM rails stay on the worker — one note on stderr). A block is answered to the host the way
+  the worker answers: an `isError` tool result `guardrail blocked: <pre|post>: <message>` with
+  `_meta.ramen.guardrail = {stage, engine: "nemo", rail?, where: "client"}`; a hook error or timeout follows the
+  pack's `fail:` (`closed` → `guardrail unavailable: …`); a pack whose NeMo config does not load blocks its opted-in
+  tools until a new pack arrives (`policy rails off` leaves them to the worker). Every rail logs one stderr line
+  (tool, stage, verdict, ms, rail) — never the payload, never the key. `sensitive_data` needs presidio
+  (`nemoguardrails[sdd]`).
+- `ramen-mcp-bridge policy rails [on|off]` shows or sets the switch (kept in the bundle, on by default when the bundle
+  carries a pack). Without the `nemo` extra the bridge prints `guardrails: local rails off (install
+  ramen-mcp-bridge[nemo])` once at start and relies on the worker's rails, which run for every client regardless —
+  the local run is an addition on top, not the gate.
+
 ### Skills over MCP (0.6.0)
 
 A group repo's `mcp/skills/<name>/` (`SKILL.md` + files) is served by Ramen as the skill `<name>` (Ramen 1.0.0c
@@ -257,6 +300,7 @@ the key never has to sit in a client's config file — `RAMEN_MCP_KEY` (or `RAME
 ```sh
 uv sync --group dev
 uv run pytest
+uv run --python 3.12 --extra nemo pytest   # with the local rails (NeMo 0.24 is 3.10–3.13); the rail tests skip without it
 ./gen_proto.sh   # regenerate src/ramen_proto from proto/ramen/v1/mcp.proto after a proto change
 ```
 

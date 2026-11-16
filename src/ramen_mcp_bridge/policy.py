@@ -5,18 +5,24 @@ keeps them at `~/.ramen/policy/<host>/<group>-<zone>.json` (0600, dirs 0700) —
 stay in the in-memory vault only (§26.3) — the evals config text at
 `~/.ramen/evals/<host>/<group>/promptfooconfig.yaml` and the SkillSpector baseline at
 `~/.ramen/skillspector/<host>/<group>/baseline.yaml` and the group's LLM configs (§31.3, manifest + files) at
-`~/.ramen/configs/<host>/<group>/`. Every gated call carries `_meta["io.ramen/evals"]`, `_meta["io.ramen/skillspector"]`
-and `_meta["io.ramen/configs"]` = `{"version": v}`; `-32026` / `-32027` / `-32028` mean the worker wants a newer one.
+`~/.ramen/configs/<host>/<group>/` and the guardrails pack (§36.3, `mcp/guardrails.yaml` + `mcp/guardrails/**`) at
+`~/.ramen/guardrails/<host>/<group>/`. Every gated call carries `_meta["io.ramen/evals"]`, `_meta["io.ramen/skillspector"]`,
+`_meta["io.ramen/configs"]` and `_meta["io.ramen/guardrails"]` = `{"version": v}`; `-32026` … `-32029` mean the worker
+wants a newer one. The token answer's `guardrails.client_llm` (the credential the local rails use) stays in memory only.
 `HOME` decides where `~` is (tests point it at a temp dir).
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sys
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,13 +31,17 @@ from pathlib import Path
 META = "io.ramen/evals"
 SKILLSPECTOR_META = "io.ramen/skillspector"
 CONFIGS_META = "io.ramen/configs"
+GUARDRAILS_META = "io.ramen/guardrails"
 EVALS_STALE = -32026  # missing or stale evals version: sign in again
 SKILLSPECTOR_STALE = -32027  # missing or stale skillspector policy version: sign in again
 CONFIGS_STALE = -32028  # missing or stale configs version: sign in again (and accept)
-KEYS = ("telemetry", "evals", "skillspector", "configs")
+GUARDRAILS_STALE = -32029  # missing or stale guardrails policy version: sign in again
+KEYS = ("telemetry", "evals", "skillspector", "configs", "guardrails")
 MISSING = "Ramen policy missing: reconnect (sign in) — Ramen cannot be used without it"
-STALE = "Ramen policy stale: reconnect (sign in) — the group's telemetry, evals, skillspector or configs changed"
+STALE = "Ramen policy stale: reconnect (sign in) — the group's telemetry, evals, skillspector, configs or guardrails changed"
 EXIT_MISSING = 3
+PACK_LIMIT = 64 * 1024  # §36.3: the packed guardrails config is at most 64 KiB (before base64)
+CLIENT_LLM_KEYS = ("provider", "model", "api_key", "base_url", "endpoint", "deployment")
 
 
 def home() -> Path:
@@ -76,6 +86,76 @@ def public_telemetry(telemetry: dict | None) -> dict | None:
     return {k: v for k, v in telemetry.items() if k != "headers"}
 
 
+def guardrails_dir(target: str, group: str) -> Path:
+    return home() / ".ramen" / "guardrails" / host_of(target) / group
+
+
+def _pack_member(name: str) -> str | None:
+    """`mcp/guardrails.yaml` → `guardrails.yaml`, `mcp/guardrails/x/y.co` → `guardrails/x/y.co`; anything that is not a
+    plain relative path inside the pack is refused."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    if parts[:1] == ["mcp"]:
+        parts = parts[1:]
+    if not parts or any(p == ".." for p in parts) or parts[0] not in ("guardrails.yaml", "guardrails"):
+        return None
+    return "/".join(parts)
+
+
+def unpack_guardrails(config: str, dest: Path) -> dict[str, bytes] | None:
+    """The base64 tar of the pack as `{relative path: bytes}` written under `dest` (0700 / 0600, replaced whole); None
+    when the pack is not a tar the bridge trusts (too big, odd member names, links)."""
+    try:
+        raw = base64.b64decode(config, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if len(raw) > PACK_LIMIT * 2:
+        return None
+    files: dict[str, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tar:
+            for m in tar.getmembers():
+                if m.isdir():
+                    continue
+                rel = _pack_member(m.name)
+                if rel is None or not m.isfile() or m.size > PACK_LIMIT:
+                    return None
+                f = tar.extractfile(m)
+                files[rel] = f.read() if f else b""
+    except (tarfile.TarError, ValueError, OSError):
+        return None
+    if "guardrails.yaml" not in files or sum(len(b) for b in files.values()) > PACK_LIMIT:
+        return None
+    shutil.rmtree(dest, ignore_errors=True)
+    for rel, data in files.items():
+        p = dest / rel
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_private(p, data.decode("utf-8", "surrogateescape"))
+    for d in {dest, *(dest / Path(rel).parent for rel in files)}:
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    return files
+
+
+def dir_sha(d: Path | None) -> str | None:
+    """sha256 over the files of the unpacked pack (relative path + bytes, sorted); None when the directory is gone."""
+    if d is None or not d.is_dir():
+        return None
+    h = hashlib.sha256()
+    for p in sorted(x for x in d.rglob("*") if x.is_file()):
+        h.update(p.relative_to(d).as_posix().encode() + b"\0" + p.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def client_llm_of(guardrails: dict | None) -> dict | None:
+    """The LLM credential the token answer hands the local rails: kept in memory, never written, never printed."""
+    llm = (guardrails or {}).get("client_llm")
+    if not isinstance(llm, dict) or not isinstance(llm.get("provider"), str) or not llm.get("provider"):
+        return None
+    return {k: v for k, v in llm.items() if k in CLIENT_LLM_KEYS and isinstance(v, str) and v}
+
+
 class Policy:
     """One (target, group, zone)'s bundle: in memory always, on disk when `target` is known. `on_update` (the client
     config writer) runs after each save."""
@@ -87,6 +167,8 @@ class Policy:
         # §31.3: the access token and the person it names, held here for the files that carry them — never saved
         self.token: str | None = None
         self.user: str | None = None
+        # §36.3: the credential the local rails call their LLM with — memory only, scrubbed from every log line
+        self.client_llm: dict | None = None
 
     @property
     def path(self) -> Path | None:
@@ -103,6 +185,38 @@ class Policy:
     @property
     def configs_dir(self) -> Path | None:
         return home() / ".ramen" / "configs" / host_of(self.target) / self.group if self.target else None
+
+    @property
+    def guardrails_dir(self) -> Path | None:
+        return guardrails_dir(self.target, self.group) if self.target else None
+
+    # --- §36.3: the guardrails policy -------------------------------------------------------------------------
+    def guardrails_version(self) -> str | None:
+        return self.version_of("guardrails")
+
+    def guardrails_required(self) -> bool:
+        return bool(((self.bundle or {}).get("guardrails") or {}).get("required"))
+
+    def guardrails_sha(self) -> str | None:
+        """The content hash of the unpacked pack at the last sign-in; None = the bundle carries no config."""
+        v = ((self.bundle or {}).get("guardrails") or {}).get("sha")
+        return v if isinstance(v, str) and v else None
+
+    def rails_enabled(self) -> bool:
+        """`policy rails on|off`: on unless switched off; meaningful only when the bundle carries a config."""
+        return (self.bundle or {}).get("rails") != "off"
+
+    def set_rails(self, on: bool) -> None:
+        self.bundle = {**(self.bundle or {}), "rails": "on" if on else "off"}
+        if self.path is not None:
+            write_private(self.path, json.dumps(self.bundle, indent=1) + "\n")
+
+    def verify_guardrails(self) -> list[str]:
+        """The unpacked pack's directory when it is gone or changed since the sign-in (as `configs.verify`)."""
+        want = self.guardrails_sha()
+        if want is None or self.guardrails_dir is None:
+            return []
+        return [] if dir_sha(self.guardrails_dir) == want else [str(self.guardrails_dir)]
 
     # --- what rides on calls -----------------------------------------------------------------------------------
     def version_of(self, key: str) -> str | None:
@@ -162,9 +276,11 @@ class Policy:
         configs: dict | None = None,
         token: str | None = None,
         user: str | None = None,
+        guardrails: dict | None = None,
     ) -> dict:
         """After a sign-in (or refresh): keep the token answer's policy, write the bundle, the evals config, the
-        SkillSpector baseline and the configs directory (manifest + files); the token stays in memory."""
+        SkillSpector baseline, the configs directory (manifest + files) and the guardrails pack; the token and the
+        rails' LLM credential stay in memory."""
         ev = dict(evals) if evals else None
         config = ev.pop("config", None) if ev else None
         ss = dict(skillspector) if skillspector else None
@@ -172,7 +288,16 @@ class Policy:
         cf = dict(configs) if configs else None
         manifest = cf.pop("manifest", None) if cf else None
         files = cf.pop("files", None) if cf else None
+        gr = dict(guardrails) if guardrails else None
+        pack = gr.pop("config", None) if gr else None
+        self.client_llm = client_llm_of(gr)
+        if gr:
+            gr.pop("client_llm", None)
+            gr.pop("sha", None)
+            if err := gr.pop("error", None):  # the console could not pack it: the version still rides
+                say(f"ramen-mcp-bridge: guardrails pack not delivered ({err}); the rails run on the worker only")
         self.token, self.user = token, user
+        rails = (self.bundle or {}).get("rails")
         self.bundle = {
             "target": self.target,
             "group": self.group,
@@ -182,8 +307,16 @@ class Policy:
             "evals": ev,
             "skillspector": ss,
             "configs": cf,
+            "guardrails": gr,
+            **({"rails": rails} if rails else {}),
         }
         if self.path is not None:
+            shutil.rmtree(self.guardrails_dir, ignore_errors=True)
+            if gr is not None and isinstance(pack, str) and pack:
+                if unpack_guardrails(pack, self.guardrails_dir) is None:
+                    say("ramen-mcp-bridge: the guardrails pack in the token answer is not a tar the bridge accepts")
+                else:
+                    gr["sha"] = dir_sha(self.guardrails_dir)
             write_private(self.path, json.dumps(self.bundle, indent=1) + "\n")
             for path, text in ((self.evals_file, config), (self.baseline_file, baseline)):
                 if isinstance(text, str) and text:
@@ -210,9 +343,11 @@ class Policy:
                     p.unlink()
             except OSError:
                 pass
-        if self.configs_dir is not None:
-            shutil.rmtree(self.configs_dir, ignore_errors=True)
+        for d in (self.configs_dir, self.guardrails_dir):
+            if d is not None:
+                shutil.rmtree(d, ignore_errors=True)
         self.bundle = None
+        self.client_llm = None
 
     # --- the offline check against /.well-known/ramen-policy ----------------------------------------------------
     def fetch_current(self, timeout: float = 10.0, context=None) -> dict:

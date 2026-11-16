@@ -22,7 +22,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from ramen_proto.ramen.v1 import mcp_pb2, mcp_pb2_grpc
 
-from . import clients, configs, oauth, policy, scan, skills
+from . import clients, configs, oauth, policy, rails, scan, skills
 from . import telemetry as tel
 
 CODES = {
@@ -193,11 +193,12 @@ class Bridge:
         """`bearer` (0.2.0): a callable giving the current access token — `bearer(force=True)` after the worker
         said UNAUTHENTICATED, once per call; without it `metadata` carries the static key. `telemetry` (0.4.0): the
         vault holding the token answer's `telemetry` object plus the recorder of what the host did (§26.3). `pol`
-        (0.5.0): the policy bundle whose evals (§29.3) and skillspector (0.6.0, §30.3) versions ride on every gated
-        call."""
+        (0.5.0): the policy bundle whose evals (§29.3), skillspector, configs and guardrails (0.6.0, §30.3 / §31.3 /
+        §36.3) versions ride on every gated call; its guardrails pack also runs locally (`rails.py`)."""
         self.stub, self.metadata, self.timeout, self.bearer = stub, metadata, timeout, bearer
         self.telemetry = telemetry or tel.Telemetry()
         self.policy = pol or policy.Policy()
+        self.rails = rails.Rails(self.policy)
 
     def _metadata(self, force: bool = False) -> list[tuple[str, str]]:
         if self.bearer is None:
@@ -243,11 +244,13 @@ class Bridge:
         policy.EVALS_STALE,
         policy.SKILLSPECTOR_STALE,
         policy.CONFIGS_STALE,
+        policy.GUARDRAILS_STALE,
     )
     POLICY_KEY: ClassVar[dict] = {
         policy.EVALS_STALE: "evals",
         policy.SKILLSPECTOR_STALE: "skillspector",
         policy.CONFIGS_STALE: "configs",
+        policy.GUARDRAILS_STALE: "guardrails",
     }
     WHY: ClassVar[dict] = {
         tel.CONFIG_STALE: "telemetry config changed",
@@ -255,17 +258,20 @@ class Bridge:
         policy.EVALS_STALE: "evals config required or changed",
         policy.SKILLSPECTOR_STALE: "skillspector policy required or changed",
         policy.CONFIGS_STALE: "configs required or changed",
+        policy.GUARDRAILS_STALE: "guardrails policy required or changed",
     }
 
     def _attach(self, raw: bytes, msg: dict) -> bytes:
         """The gated call with the report since the last one under `params._meta["io.ramen/telemetry"]` and the
-        evals (0.5.0), skillspector and configs (0.6.0) versions under `params._meta["io.ramen/<key>"]` — each when
-        the bridge holds one; the body is forwarded in the era the host spoke (the bridge does not upgrade eras)."""
+        evals (0.5.0), skillspector, configs and guardrails (0.6.0) versions under `params._meta["io.ramen/<key>"]` —
+        each when the bridge holds one; the body is forwarded in the era the host spoke (the bridge does not upgrade
+        eras)."""
         version = self.telemetry.version()
         versions = {
             policy.META: self.policy.evals_version(),
             policy.SKILLSPECTOR_META: self.policy.skillspector_version(),
             policy.CONFIGS_META: self.policy.configs_version(),
+            policy.GUARDRAILS_META: self.policy.guardrails_version(),
         }
         if version is None and not any(versions.values()):
             return raw
@@ -282,15 +288,16 @@ class Bridge:
         return json.dumps(out).encode()
 
     def _configs_in_place(self, raw: bytes) -> tuple[bool, bytes | None]:
-        """§31.3: a recorded configs or telemetry target that was removed or changed stops every gated call — after
-        one re-sign-in, which writes the files again — until it is back; the refusal names the files."""
-        broken = configs.verify(self.policy)
+        """§31.3 / §36.3: a recorded configs or telemetry target, or the unpacked guardrails pack, that was removed or
+        changed stops every gated call — after one re-sign-in, which writes the files again — until it is back; the
+        refusal names the files."""
+        broken = configs.verify(self.policy) + self.policy.verify_guardrails()
         if broken and self.bearer is not None:
             try:
                 self.bearer(force=True)
             except oauth.OAuthError:
                 pass
-            broken = configs.verify(self.policy)
+            broken = configs.verify(self.policy) + self.policy.verify_guardrails()
         if not broken:
             return False, None
         line = {"level": "warn", "msg": configs.REMOVED, "paths": broken}
@@ -300,6 +307,26 @@ class Bridge:
             return True, None
         err = {"code": policy.CONFIGS_STALE, "message": configs.REMOVED, "data": {"paths": broken}}
         return True, json.dumps({"jsonrpc": "2.0", "id": rid, "error": err}).encode()
+
+    def _local_block(self, msg: dict, result: dict) -> bytes | None:
+        """A rail on this machine stopped the call (or its result): the host gets the worker's shape of a block."""
+        rid = msg.get("id")
+        return None if rid is None else json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode()
+
+    def _rails_pre(self, msg: dict) -> bytes | None:
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if msg.get("method") != "tools/call":
+            return None
+        block = self.rails.pre(params)
+        return None if block is None else (self._local_block(msg, block) or b"")
+
+    def _rails_post(self, msg: dict, reply: bytes | None) -> bytes | None:
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        out = _parse(reply)
+        if msg.get("method") != "tools/call" or out is None or not isinstance(out.get("result"), dict):
+            return reply
+        block = self.rails.post(params, out["result"])
+        return reply if block is None else self._local_block(msg, block)
 
     def _telemetry_in_hand(self, raw: bytes) -> bytes | None:
         """P4-B3: the bundle says the group requires telemetry but no telemetry object is held (a still-valid
@@ -325,6 +352,8 @@ class Bridge:
                 return reply
         if (reply := self._telemetry_in_hand(raw)) is not None:
             return reply
+        if (blocked := self._rails_pre(msg)) is not None:  # §36.3: the input rails, before the call leaves
+            return blocked or None
         reply, delivered = self._exchange(self._attach(raw, msg))
         code = _policy_code(_parse(reply)) if delivered else None
         if not delivered:
@@ -332,7 +361,7 @@ class Bridge:
             return reply
         if code not in self.RETRY_CODES:
             rec.commit()
-            return reply
+            return self._rails_post(msg, reply)
         rec.restore()
         why = self.WHY[code]
         print(json.dumps({"level": "info", "msg": f"{why}; signing in again and retrying once"}), file=sys.stderr)
@@ -354,8 +383,8 @@ class Bridge:
         reply, delivered = self._exchange(self._attach(raw, msg))
         if delivered and _policy_code(_parse(reply)) not in self.RETRY_CODES:
             rec.commit()
-        else:
-            rec.restore()
+            return self._rails_post(msg, reply)
+        rec.restore()
         return reply
 
     def _local_report(self, msg: dict, params: dict) -> bytes | None:
@@ -519,9 +548,11 @@ def connect(a: argparse.Namespace, ch: grpc.Channel) -> "Bridge | int":
         def bearer(force: bool = False) -> str:
             return client.bearer(force=force, nonblocking=True)
 
-        return Bridge(
+        b = Bridge(
             mcp_pb2_grpc.McpStub(ch), md, a.timeout, bearer=bearer, telemetry=tel.Telemetry(client.vault), pol=pol
         )
+        b.rails.announce()  # §36.3: one line when the pack is here and the nemo extra is not
+        return b
     md = [("authorization", f"Bearer {a.key}"), *md]
     return Bridge(mcp_pb2_grpc.McpStub(ch), md, a.timeout)
 
@@ -568,7 +599,8 @@ def skills_main(argv: list[str]) -> int:
 # --- 0.5.0: `ramen-mcp-bridge policy show|check|remove` (§29.3; the local scan of §30.3 since 0.6.0) ------------
 def policy_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="ramen-mcp-bridge policy", description="the policy bundle kept at sign-in")
-    ap.add_argument("action", choices=["show", "check", "remove"])
+    ap.add_argument("action", choices=["show", "check", "remove", "rails"])
+    ap.add_argument("switch", nargs="?", choices=["on", "off"], help="rails: run the group's guardrails locally")
     ap.add_argument("--target", default=_env("TARGET"), help="host:port the bundle was made for")
     ap.add_argument("--group", default=_env("GROUP"))
     ap.add_argument("--zone", default=_env("ZONE"))
@@ -589,9 +621,18 @@ def policy_main(argv: list[str]) -> int:
             return 1
         print(policy.MISSING, file=sys.stderr)
         return 2
+    if a.action == "rails":  # §36.3: the local rails switch, kept in the bundle
+        if a.switch is None:
+            print("on" if pol.rails_enabled() else "off")
+            return 0
+        pol.set_rails(a.switch == "on")
+        print(f"local guardrails {a.switch} for {pol.group}/{pol.zone} on {pol.target}", file=sys.stderr)
+        return 0
     if a.action == "show":
         print(json.dumps(pol.bundle, indent=1))
         for line in configs.show(pol):  # §31.3: every configs / telemetry target and whether it is still in place
+            print(line)
+        for line in rails_show(pol):
             print(line)
         return 0 if a.no_client_scan else scan.check(pol)
     if a.action == "remove":
@@ -604,6 +645,11 @@ def policy_main(argv: list[str]) -> int:
         return 0
     if (rc := configs.check(pol)) != 0:  # §31.3: the files first — offline, and the reason the hook exists
         return rc
+    if broken := pol.verify_guardrails():  # §36.3: the unpacked pack, the same way
+        for p in broken:
+            print(f"ramen guardrails: {p}: removed or changed", file=sys.stderr)
+        print(configs.REMOVED, file=sys.stderr)
+        return configs.EXIT_REMOVED
     import ssl
 
     try:
@@ -617,6 +663,17 @@ def policy_main(argv: list[str]) -> int:
         return 2
     print(f"Ramen policy up to date for {pol.group}/{pol.zone} on {pol.target}")
     return 0 if a.no_client_scan else scan.check(pol)
+
+
+def rails_show(pol: policy.Policy) -> list[str]:
+    """`policy show`: the guardrails pack's state and whether the local rails run."""
+    if pol.guardrails_sha() is None:
+        return []
+    ok = not pol.verify_guardrails()
+    state = "on" if pol.rails_enabled() else "off"
+    if pol.rails_enabled() and not rails.available():
+        state = "on but inactive: install ramen-mcp-bridge[nemo]"
+    return [f"{'ok     ' if ok else 'CHANGED'} {pol.guardrails_dir} (guardrails pack, local rails {state})"]
 
 
 if __name__ == "__main__":
