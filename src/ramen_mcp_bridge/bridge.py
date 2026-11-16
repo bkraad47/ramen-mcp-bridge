@@ -198,7 +198,7 @@ class Bridge:
         self.stub, self.metadata, self.timeout, self.bearer = stub, metadata, timeout, bearer
         self.telemetry = telemetry or tel.Telemetry()
         self.policy = pol or policy.Policy()
-        self.rails = rails.Rails(self.policy)
+        self.rails = rails.Rails(self.policy, bearer)  # §38.1: the console's LLM proxy is called as the person
 
     def _metadata(self, force: bool = False) -> list[tuple[str, str]]:
         if self.bearer is None:

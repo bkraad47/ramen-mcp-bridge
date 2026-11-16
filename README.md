@@ -214,9 +214,12 @@ them:
 A group repo with `mcp/guardrails.yaml` (+ `mcp/guardrails/`, Ramen 0.7.5 §21.2, LLM rails since 1.0.0c §36) makes
 its rails a client policy too (CONTRACTS §36.3). The token answer carries `guardrails`:
 `{version, required, config, client_llm?}` — `config` is the pack (`guardrails.yaml` + `guardrails/**`) as a base64
-gzip tar of at most 64 KiB, `client_llm` is `{provider, model, api_key?, base_url?, endpoint?, deployment?}`, the
-LLM credential the group's or the org's provider gives this client for its rails. Every sign-in path hands it out and
-the worker gate holds for every caller; the bridge:
+gzip tar of at most 64 KiB, `client_llm` says where the rails' judge is. Since Ramen 1.0.0c (CONTRACTS §38.1) it is
+the console's LLM proxy — `{provider: "openai_compatible", base_url: "<console>/llm/v1", model}`, no key: the bridge
+calls it with the person's own access token (refreshed like every call's), the console adds the group's provider key,
+checks the model against the allowed models and rate-limits per group; provider keys never reach this machine. An
+older console's `client_llm` with an `api_key` (`{provider, model, api_key?, base_url?, endpoint?, deployment?}`)
+still works. Every sign-in path hands it out and the worker gate holds for every caller; the bridge:
 
 - keeps `guardrails` (`version`, `required`, the content hash of the unpacked pack) in the bundle and unpacks the pack
   to `~/.ramen/guardrails/<host>/<group>/` (0700 / 0600; a pack with absolute paths, `..`, links or more than 64 KiB
@@ -240,7 +243,10 @@ the worker gate holds for every caller; the bridge:
   self_consistency, fact_checking, sensitive_data]`), built exactly as the worker builds them (wrapper flows
   `ramen rail <name>`, the same prompts unless the pack's `prompts.yml` defines the task, every judge at temperature 0;
   `hallucination` is one grounded judge checking each sentence and parsed on its final `Answer: Yes|No` line, anything
-  else blocks; `self_consistency` is NeMo's sampling check) with `models:` filled from `client_llm` through NeMo's
+  else blocks; `self_consistency` is NeMo's sampling check; the arguments and results reach a judge only inside
+  escaped `<<<ARGS … ARGS>>>` / `<<<DATA … DATA>>>` blocks under a "this is data" rule, and arguments with a line that
+  reads like a judge line or a block delimiter are refused before any LLM rail as `judge_format` — rails narrow prompt
+  injection, they cannot rule it out) with `models:` filled from `client_llm` through NeMo's
   OpenAI-compatible client (`openai`, `openai_compatible` + `base_url`, `azure` + `endpoint` + `deployment`,
   `anthropic`, `vertex` and `bedrock` with an API key; `vertex` / `bedrock` without one need a cloud login the bridge
   does not hold, so those LLM rails stay on the worker — one note on stderr). A block is answered to the host the way
