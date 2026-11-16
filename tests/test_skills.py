@@ -35,7 +35,7 @@ def served(fake):  # noqa: F811
 
 
 def flags(fake):  # noqa: F811
-    return ["--target", fake.target, "--key", "good", "--group", "demo", "--zone", "local"]
+    return ["--target", fake.target, "--insecure", "--key", "good", "--group", "demo", "--zone", "local"]
 
 
 def ledger():

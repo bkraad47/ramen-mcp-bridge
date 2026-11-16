@@ -50,9 +50,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--group", default=_env("GROUP", ""), help="ramen-group metadata (RAMEN_BRIDGE_GROUP)")
     ap.add_argument("--zone", default=_env("ZONE", ""), help="ramen-zone metadata (RAMEN_BRIDGE_ZONE)")
-    ap.add_argument("--tls", action="store_true", default=_env("TLS") in ("1", "true"), help="TLS (RAMEN_BRIDGE_TLS=1)")
-    ap.add_argument("--insecure", action="store_true", help="plaintext h2c (default unless --tls/--ca)")
-    ap.add_argument("--ca", default=_env("CA"), help="PEM CA bundle for TLS (RAMEN_BRIDGE_CA); implies --tls")
+    # D86 (Ramen §39.3): TLS is the default. `--tls` (and RAMEN_BRIDGE_TLS) is kept so old configs still start.
+    ap.add_argument("--tls", action="store_true", help="TLS — the default since 0.6.0; accepted for old configs")
+    ap.add_argument(
+        "--insecure",
+        action="store_true",
+        default=_env("INSECURE") in ("1", "true"),
+        help="plaintext h2c, local development only; an error next to --tls or --ca (RAMEN_BRIDGE_INSECURE=1)",
+    )
+    ap.add_argument(
+        "--ca", default=_env("CA"), help="PEM CA bundle that replaces the system trust store (RAMEN_BRIDGE_CA)"
+    )
     ap.add_argument("--timeout", type=float, default=float(_env("TIMEOUT", "120")), help="per-call deadline, seconds")
     ap.add_argument("--health", nargs="?", const="", metavar="SERVICE", help="check grpc.health.v1 and exit")
     ap.add_argument(
@@ -126,7 +134,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             ap.error("--keychain: no `security` (macOS) or `secret-tool` (Secret Service) on this machine")
     elif a.health is None and not a.key:
         ap.error("--key (or RAMEN_BRIDGE_KEY / RAMEN_MCP_KEY) or --oauth is required")
-    a.use_tls = bool(a.tls or a.ca) and not a.insecure
+    if a.insecure:
+        for flag, given in (("--tls", a.tls), ("--ca", a.ca)):
+            if given:
+                ap.error(f"--insecure and {flag} exclude each other: drop --insecure to use TLS (the default)")
+        print("ramen-mcp-bridge: plaintext h2c: local development only", file=sys.stderr)
+    a.use_tls = not a.insecure
     return a
 
 
@@ -471,8 +484,8 @@ def bridge_args(a: argparse.Namespace) -> list[str]:
     args = ["ramen-mcp-bridge@latest", "--target", a.target]
     if a.ca:
         args += ["--ca", a.ca]
-    elif a.use_tls:
-        args.append("--tls")
+    elif a.insecure:
+        args.append("--insecure")
     args += ["--oauth", a.oauth, "--client-id", a.client_id, "--group", a.group, "--zone", a.zone]
     return args
 

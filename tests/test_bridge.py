@@ -120,13 +120,13 @@ def run(b: bridge.Bridge, data: bytes) -> bytes:
 
 def test_parse_args_flags_and_env(monkeypatch):
     a = bridge.parse_args(["--target", "h:1", "--key", "k", "--group", "g", "--zone", "z"])
-    assert (a.target, a.key, a.group, a.zone, a.use_tls, a.timeout) == ("h:1", "k", "g", "z", False, 120.0)
+    # D86 (§39.3): TLS is the default
+    assert (a.target, a.key, a.group, a.zone, a.use_tls, a.timeout) == ("h:1", "k", "g", "z", True, 120.0)
     assert bridge.parse_args(["--target", "h:1", "--key", "k", "--tls"]).use_tls
     assert bridge.parse_args(["--target", "h:1", "--key", "k", "--ca", "/x.pem"]).use_tls
-    assert not bridge.parse_args(["--target", "h:1", "--key", "k", "--ca", "/x.pem", "--insecure"]).use_tls
     monkeypatch.setenv("RAMEN_BRIDGE_TARGET", "e:2")
     monkeypatch.setenv("RAMEN_BRIDGE_KEY", "ek")
-    monkeypatch.setenv("RAMEN_BRIDGE_TLS", "1")
+    monkeypatch.setenv("RAMEN_BRIDGE_TLS", "1")  # harmless: TLS is the default anyway
     monkeypatch.setenv("RAMEN_BRIDGE_TIMEOUT", "3")
     a = bridge.parse_args([])
     assert (a.target, a.key, a.use_tls, a.timeout, a.health) == ("e:2", "ek", True, 3.0, None)
@@ -149,10 +149,59 @@ def test_parse_args_flags_and_env(monkeypatch):
         bridge.parse_args(["--key", "k"])
 
 
+def test_insecure_is_explicit_and_warns(monkeypatch, capsys):
+    """D86: plaintext h2c only on request, with one warning; never silently next to --tls / --ca."""
+    for k in ("TLS", "CA", "INSECURE"):
+        monkeypatch.delenv(f"RAMEN_BRIDGE_{k}", raising=False)
+    a = bridge.parse_args(["--target", "h:1", "--key", "k", "--insecure"])
+    assert not a.use_tls and a.insecure
+    assert capsys.readouterr().err.count("plaintext h2c: local development only") == 1
+    assert bridge.parse_args(["--target", "h:1", "--key", "k"]).use_tls
+    assert "plaintext" not in capsys.readouterr().err
+    for extra in (["--tls"], ["--ca", "/x.pem"]):
+        with pytest.raises(SystemExit) as e:
+            bridge.parse_args(["--target", "h:1", "--key", "k", "--insecure", *extra])
+        assert e.value.code == 2
+        assert f"--insecure and {extra[0]} exclude each other" in capsys.readouterr().err
+    monkeypatch.setenv("RAMEN_BRIDGE_INSECURE", "1")  # the env form of --insecure
+    assert not bridge.parse_args(["--target", "h:1", "--key", "k"]).use_tls
+    monkeypatch.setenv("RAMEN_BRIDGE_CA", "/x.pem")
+    with pytest.raises(SystemExit):
+        bridge.parse_args(["--target", "h:1", "--key", "k"])
+    monkeypatch.setenv("RAMEN_BRIDGE_INSECURE", "0")
+    assert bridge.parse_args(["--target", "h:1", "--key", "k"]).use_tls
+    monkeypatch.delenv("RAMEN_BRIDGE_CA")
+    monkeypatch.setenv("RAMEN_BRIDGE_TLS", "1")  # an old TLS=1 next to --insecure is not a conflict: it is the default
+    assert not bridge.parse_args(["--target", "h:1", "--key", "k", "--insecure"]).use_tls
+
+
+def test_channel_is_secure_by_default(monkeypatch):
+    made = {}
+    monkeypatch.setattr(bridge.grpc, "secure_channel", lambda t, c: made.setdefault("secure", t))
+    monkeypatch.setattr(bridge.grpc, "insecure_channel", lambda t: made.setdefault("insecure", t))
+    bridge.channel(bridge.parse_args(["--target", "h:1", "--key", "k"]))
+    assert made == {"secure": "h:1"}
+    made.clear()
+    bridge.channel(bridge.parse_args(["--target", "h:1", "--key", "k", "--insecure"]))
+    assert made == {"insecure": "h:1"}
+
+
+def test_bridge_args_carry_the_transport_the_user_chose():
+    """The client config the bridge writes at sign-in: no --tls (the default), --ca or --insecure as given."""
+    base = ["--target", "h:443", "--oauth", "https://c", "--client-id", "cid", "--group", "g", "--zone", "z"]
+    args = bridge.bridge_args(bridge.parse_args(base))
+    assert "--tls" not in args and "--insecure" not in args and "--ca" not in args
+    assert bridge.bridge_args(bridge.parse_args([*base, "--tls"])) == args
+    assert args[args.index("--target") + 1] == "h:443" and args[0] == "ramen-mcp-bridge@latest"
+    with_ca = bridge.bridge_args(bridge.parse_args([*base, "--ca", "/ca.pem"]))
+    assert with_ca[with_ca.index("--ca") + 1] == "/ca.pem"
+    assert "--insecure" in bridge.bridge_args(bridge.parse_args([*base, "--insecure"]))
+
+
 def test_channel_tls_and_plain(tmp_path):
     ca = tmp_path / "ca.pem"
     ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nMA==\n-----END CERTIFICATE-----\n")
-    assert bridge.channel(bridge.parse_args(["--target", "h:1", "--key", "k"])) is not None
+    assert bridge.channel(bridge.parse_args(["--target", "h:1", "--key", "k", "--insecure"])) is not None
     assert bridge.channel(bridge.parse_args(["--target", "h:1", "--key", "k", "--tls"])) is not None
     assert bridge.channel(bridge.parse_args(["--target", "h:1", "--key", "k", "--ca", str(ca)])) is not None
 
@@ -212,15 +261,15 @@ def test_health_probe(fake, capsys):
     assert bridge.health(ch, "ramen.v1.Mcp", 5) == 1
     assert bridge.health(ch, "unknown", 5) == 1
     assert "NOT_FOUND" in capsys.readouterr().err
-    assert bridge.main(["--target", fake.target, "--health"]) == 0
-    assert bridge.main(["--target", "127.0.0.1:1", "--health", "--timeout", "1"]) == 1
+    assert bridge.main(["--target", fake.target, "--insecure", "--health"]) == 0
+    assert bridge.main(["--target", "127.0.0.1:1", "--insecure", "--health", "--timeout", "1"]) == 1
 
 
 def test_main_end_to_end_over_stdio(fake, monkeypatch):
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n')))
     out = io.BytesIO()
     monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(out))
-    assert bridge.main(["--target", fake.target, "--key", "good", "--group", "g", "--zone", "z"]) == 0
+    assert bridge.main(["--target", fake.target, "--insecure", "--key", "good", "--group", "g", "--zone", "z"]) == 0
     assert json.loads(out.getvalue()) == {"jsonrpc": "2.0", "id": 1, "result": {}}
     assert (fake.seen[-1]["ramen-group"], fake.seen[-1]["ramen-zone"]) == ("g", "z")
 
@@ -228,7 +277,7 @@ def test_main_end_to_end_over_stdio(fake, monkeypatch):
 def test_bridge_as_subprocess_omits_empty_routing_metadata(fake):
     env = os.environ | {"PYTHONPATH": SRC, "RAMEN_BRIDGE_KEY": "good"}
     p = subprocess.run(
-        [sys.executable, "-m", "ramen_mcp_bridge.bridge", "--target", fake.target],
+        [sys.executable, "-m", "ramen_mcp_bridge.bridge", "--target", fake.target, "--insecure"],
         input=b'{"jsonrpc":"2.0","id":5,"method":"ping"}\n',
         capture_output=True,
         env=env,
@@ -249,7 +298,17 @@ def test_mcp_sdk_stdio_client_through_the_bridge(fake):
 
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "ramen_mcp_bridge.bridge", "--target", fake.target, "--key", "good", "--group", "demo"],
+        args=[
+            "-m",
+            "ramen_mcp_bridge.bridge",
+            "--target",
+            fake.target,
+            "--insecure",
+            "--key",
+            "good",
+            "--group",
+            "demo",
+        ],
         env=os.environ | {"PYTHONPATH": SRC},
     )
 

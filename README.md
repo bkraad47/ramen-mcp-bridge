@@ -17,20 +17,27 @@ pip install ramen-mcp-bridge        # → ramen-mcp-bridge on PATH
 
 ## Use
 
-Against a **local** worker (plaintext, no TLS):
+**TLS is the default (0.6.0, Ramen D86).** The bridge always dials TLS and verifies the server against your
+system's CA trust store; `--tls` is still accepted so older configs keep working, but it changes nothing.
+
+Against a **cloud** deployment (GKE, EKS or AKS) fronted by a load balancer with a publicly-trusted certificate
+(the default since Ramen v0.5.5 — see [deploy/README.md](https://github.com/bkraad47/ramen/blob/main/deploy/README.md)):
 ```sh
-RAMEN_MCP_KEY="$KEY" ramen-mcp-bridge --target localhost:8080 --insecure --group demo --zone local
+ramen-mcp-bridge --target <public-hostname>:443 --key rmk_… --group demo --zone a
+```
+Nothing to download, no `kubectl` command. A cluster still using the self-signed fallback needs its certificate
+pulled once (`kubectl -n ramen-system get secret ramen-console-tls -o jsonpath='{.data.tls\.crt}' | base64 -d >
+ramen-lb.pem`) and `--ca ramen-lb.pem`. **`--ca` replaces the system trust store** for that connection (and for the
+console during `--oauth` sign-in); the hostname is still verified.
+
+Against a **local** Ramen (`make up`, which runs TLS with its generated CA since Ramen D86):
+```sh
+RAMEN_MCP_KEY="$KEY" ramen-mcp-bridge --target localhost:8080 --ca deploy/local/.certs/ca/ca.crt --group demo --zone local
 ```
 
-Against a **cloud** deployment (GCP GKE or AWS EKS) fronted by a load balancer with a publicly-trusted
-certificate (the default since Ramen v0.5.5 — see [deploy/README.md](https://github.com/bkraad47/ramen/blob/main/deploy/README.md)):
-```sh
-ramen-mcp-bridge --target <public-hostname>:443 --tls --key rmk_… --group demo --zone a
-```
-`--tls` alone verifies against your system's CA trust store — nothing to download, no `kubectl` command.
-An older cluster still using the self-signed fallback needs its CA pulled once (`kubectl -n ramen-system
-get secret ramen-console-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > ramen-lb.pem`) and a `--ca
-ramen-lb.pem` flag.
+`--insecure` (`RAMEN_BRIDGE_INSECURE=1`) speaks plaintext h2c and prints `plaintext h2c: local development only` on
+stderr — for a bare `ramen-node` on your laptop, never for a deployment (Ramen's cloud workers refuse plaintext).
+`--insecure` next to `--tls` or `--ca` (flag or `RAMEN_BRIDGE_CA`) is an error (exit 2), not a silent downgrade.
 
 ## Sign in as yourself (0.2.0)
 
@@ -41,7 +48,7 @@ issuer). A super admin registers an OAuth client on the console's Config page wi
 *MCP User* is enough):
 
 ```sh
-ramen-mcp-bridge --target <public-hostname>:443 --tls --oauth https://<public-hostname> --client-id <client id> \
+ramen-mcp-bridge --target <public-hostname>:443 --oauth https://<public-hostname> --client-id <client id> \
   --group demo --zone a
 ```
 
@@ -123,7 +130,8 @@ config text) — Ramen 1.0.0c, CONTRACTS §29.3. The bridge keeps and enforces i
     and evals are required, their versions, and the command to sign in again;
   - **VS Code** user `settings.json` (`~/Library/Application Support/Code/User` on macOS, `~/.config/Code/User` on
     Linux, `%APPDATA%\Code\User` on Windows) → `mcp.servers["ramen-<g>-<z>"]` = `uvx ramen-mcp-bridge@latest
-    --target … --tls --oauth … --client-id … --group … --zone …`.
+    --target … --oauth … --client-id … --group … --zone …` (plus `--ca <pem>` or `--insecure` when
+    you signed in with one).
   A settings file the bridge cannot parse as plain JSON (comments, trailing commas) is left untouched with a warning.
   A ledger `~/.ramen/clients.json` lists every file and key written, with each editor file's pre-ramen bytes (never a
   token), so `policy remove` gives the file back byte-for-byte when nothing else changed. Two hosts of one group and
@@ -269,7 +277,7 @@ Phase 7, CONTRACTS §33.2): `skills/list` names them (`name`, `description`, `ve
 group's tool access). The bridge installs them for you; the connection flags are the bridge's own:
 
 ```sh
-ramen-mcp-bridge skills list --target <host>:443 --tls --oauth https://<console> --client-id <id> --group demo --zone a
+ramen-mcp-bridge skills list --target <host>:443 --oauth https://<console> --client-id <id> --group demo --zone a
 ramen-mcp-bridge skills install iris-analyst [--dir ~/.claude/skills] --target … --key rmk_… --group demo --zone a
 ```
 
@@ -293,16 +301,17 @@ config, which is why the files above exist.
 Point an MCP client at it directly:
 ```json
 {"mcpServers": {"ramen-stdio": {"command": "ramen-mcp-bridge",
-  "env": {"RAMEN_BRIDGE_TARGET": "<public-hostname>:443", "RAMEN_BRIDGE_TLS": "1",
+  "env": {"RAMEN_BRIDGE_TARGET": "<public-hostname>:443",
           "RAMEN_MCP_KEY": "rmk_…", "RAMEN_BRIDGE_GROUP": "demo", "RAMEN_BRIDGE_ZONE": "a"}}}}
 ```
 
 Every flag has a `RAMEN_BRIDGE_*` environment variable equivalent (`--target` → `RAMEN_BRIDGE_TARGET`,
-`--tls` → `RAMEN_BRIDGE_TLS=1`, `--group` → `RAMEN_BRIDGE_GROUP`, `--zone` → `RAMEN_BRIDGE_ZONE`,
+`--insecure` → `RAMEN_BRIDGE_INSECURE=1`, `--ca` → `RAMEN_BRIDGE_CA`, `--group` → `RAMEN_BRIDGE_GROUP`, `--zone` → `RAMEN_BRIDGE_ZONE`,
 `--no-client-config` → `RAMEN_BRIDGE_NO_CLIENT_CONFIG=1`, `--no-client-scan` → `RAMEN_BRIDGE_NO_CLIENT_SCAN=1`,
 `--no-shell-rc` → `RAMEN_BRIDGE_NO_SHELL_RC=1`) so
 the key never has to sit in a client's config file — `RAMEN_MCP_KEY` (or `RAMEN_BRIDGE_KEY`) is enough.
-`--health [SERVICE]` checks `grpc.health.v1` and exits 0 when SERVING, for a liveness probe.
+`--health [SERVICE]` checks `grpc.health.v1` and exits 0 when SERVING, for a liveness probe (over TLS like every
+connection: give it `--ca`, or `--insecure` for a plaintext dev node).
 
 ## Develop
 

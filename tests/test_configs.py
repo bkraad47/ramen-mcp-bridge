@@ -622,7 +622,19 @@ def test_main_signs_in_and_applies_configs_and_telemetry(home, fake, auth_cf, mo
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(req(1, "ping"))))
     out = io.BytesIO()
     monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(out))
-    args = ["--target", fake.target, "--oauth", auth_cf.url, "--client-id", "cid", "--group", "demo", "--zone", "local"]
+    args = [
+        "--target",
+        fake.target,
+        "--insecure",
+        "--oauth",
+        auth_cf.url,
+        "--client-id",
+        "cid",
+        "--group",
+        "demo",
+        "--zone",
+        "local",
+    ]
     assert bridge.main([*args, "--no-shell-rc"]) == 0
     assert json.loads(out.getvalue())["result"] == {}
     claude = json.loads((home / ".claude" / "settings.json").read_text())
