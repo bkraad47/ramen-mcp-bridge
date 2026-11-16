@@ -9,19 +9,23 @@ without the `[nemo]` extra the bridge warns once and the worker's rails alone ap
 
 This mirrors the worker (`ramen_runtime.guardrails_llm` / `guardrails_nemo`, §36.1) so the bridge blocks what the
 worker blocks: the same rail names (`self_check_input`, `jailbreak_detection`, `topical {topics}`,
-`self_check_output`, `hallucination`, `fact_checking`, `sensitive_data`), the same generated wrapper flows
-`ramen rail <name>` gated by the call's `$ramen_rails` context, the same prompts (a repo `prompts.yml` task wins), the
-same provider → OpenAI-compatible endpoint map on NeMo 0.24's default client. `vertex` / `bedrock` without an API key
+`self_check_output`, `hallucination`, `self_consistency`, `fact_checking`, `sensitive_data`), the same generated
+wrapper flows `ramen rail <name>` gated by the call's `$ramen_rails` context, the same prompts and task settings (a
+repo `prompts.yml` task wins; the hallucination judge parsed on its final `Answer:` line), the same evidence for the
+post rails (the result's `structuredContent` + the call's arguments), every judge at temperature 0, the same
+provider → OpenAI-compatible endpoint map on NeMo 0.24's default client. `vertex` / `bedrock` without an API key
 need the user's own cloud login, which the bridge does not hold: those LLM rails stay on the worker (one note).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -73,7 +77,8 @@ RAILS: dict[str, Rail] = {
     "jailbreak_detection": Rail(("pre",), True),
     "topical": Rail(("pre",), True, ("topics",), ("topics",)),
     "self_check_output": Rail(("post",), True),
-    "hallucination": Rail(("post",), True),
+    "hallucination": Rail(("post",), True),  # one deterministic judge: the report against the tool's own data
+    "self_consistency": Rail(("post",), True),  # NeMo's sampling check (2 samples at temperature 1): not deterministic
     "fact_checking": Rail(("post",), True),
     "sensitive_data": Rail(("pre", "post"), False, ("entities",)),
 }
@@ -221,10 +226,13 @@ _BODY = {
     "self_check_input": "$response = execute self_check_input",
     "jailbreak_detection": '$response = execute self_check_input(variant="jailbreak_detection")',
     "self_check_output": "$response = execute self_check_output",
-    "hallucination": (
-        "$response = execute self_check_hallucination(bot_message=$bot_message, last_bot_prompt=$ramen_prompt)"
+    "hallucination": '$response = execute self_check_output(variant="hallucination", bot_message=$ramen_statement)',
+    "self_consistency": (
+        "$response = execute self_check_hallucination(bot_message=$ramen_statement, last_bot_prompt=$ramen_grounding)"
     ),
-    "fact_checking": "$response = execute self_check_facts(relevant_chunks=$ramen_prompt, bot_message=$bot_message)",
+    "fact_checking": (
+        "$response = execute self_check_facts(relevant_chunks=$ramen_evidence, bot_message=$ramen_statement)"
+    ),
     ("sensitive_data", "pre"): '$response = execute detect_sensitive_data(source="input", text=$user_message)',
     ("sensitive_data", "post"): '$response = execute detect_sensitive_data(source="output", text=$bot_message)',
     "topical": "$response = execute self_check_input(variant=$ramen_topical)",
@@ -235,7 +243,8 @@ _MESSAGE = {
     "topical": "the request is off topic for this tool",
     "self_check_output": "the result was refused by the self_check_output rail",
     "hallucination": "the result did not pass the hallucination check",
-    "fact_checking": "the result is not supported by the call's arguments",
+    "self_consistency": "the result did not pass the self-consistency check",
+    "fact_checking": "the result is not supported by the tool's own data",
     "sensitive_data": "sensitive data was detected",
 }
 
@@ -298,16 +307,100 @@ PROMPTS: dict[str, str] = {
         "Question: Should the tool result be blocked (Yes or No)?\nAnswer:"
     ),
     "self_check_facts": (
-        "You are given a task to identify if the hypothesis is grounded and entailed by the evidence.\n"
-        "You will only use the contents of the evidence and not rely on external knowledge.\n"
-        'Answer with yes/no.\n"evidence": {{ evidence }}\n"hypothesis": {{ response }}\n"entails":'
+        "A tool answered a call. The evidence below is the tool's OWN computed data (its structured result) and the\n"
+        "arguments of the call; it is authoritative. Your task is to decide whether the report is grounded in and\n"
+        "entailed by that evidence: every number, count and comparison the report states must appear in or follow\n"
+        "from the data. Use only the evidence, never external knowledge. Answer with yes/no.\n"
+        "{{ evidence }}\n"
+        'Report to check: "{{ response }}"\n"entails":'
+    ),
+    "self_check_output $variant=hallucination": (
+        "A tool answered a call. The data below is the tool's OWN computed data (its structured result) and the\n"
+        "arguments of the call; it is authoritative and complete. Your task is to find hallucinations in the report:\n"
+        "a number, count, name or comparison the report states that does not appear in the data and does not follow\n"
+        "from it by simple arithmetic or counting. Numbers that match the data exactly, or after rounding, are\n"
+        "supported. Use only the data, never external knowledge.\n"
+        "{{ ramen_evidence }}\n"
+        'Report to check: "{{ bot_response }}"\n\n'
+        "Question: Does the report state anything that is not supported by the data?\n"
+        'First check each sentence of the report against the data, one short line per sentence ending in "(supported)" '
+        'or "(unsupported)". Then end with a final line that is exactly "Answer: Yes" if any sentence is unsupported, '
+        'or "Answer: No" if every sentence is supported.'
     ),
     "self_check_hallucination": (
-        "You are given a task to identify if the hypothesis is in agreement with the context below.\n"
-        "You will only use the contents of the context and not rely on external knowledge.\n"
-        'Answer with yes/no.\n"context": {{ paragraph }}\n"hypothesis": {{ statement }}\n"agreement":'
+        "A tool answered a call. The data below is the tool's OWN computed data (its structured result) and the\n"
+        "arguments of the call; it is authoritative. The context is independent restatements of that data. Your task\n"
+        "is to decide whether the report agrees with the data: every number, count and comparison it states must\n"
+        "appear in or follow from the data. Use only the data and the context, never external knowledge. Answer with\n"
+        "yes/no.\n"
+        "{{ ramen_evidence }}\n"
+        'Context (restatements): "{{ paragraph }}"\n'
+        'Report to check: "{{ statement }}"\n"agreement":'
     ),
 }
+# A bare Yes/No at temperature 0 judged a correct iris_report "Yes" every time (gpt-4o-mini, Azure 1.0.0b26); checked
+# sentence by sentence first, the same model answers right both ways. NeMo's `is_content_safe` reads the first two
+# words, so the reasoned reply is parsed on its final line instead.
+FINAL_ANSWER = "ramen_final_answer"
+JUDGE_MAX_TOKENS = 2048  # one short line per sentence + the verdict; a reply cut before its verdict blocks
+_VERDICT = re.compile(r"^\W*(?:answer|verdict)?\W*(yes|no)\b", re.IGNORECASE)
+
+
+def final_answer(response: str) -> list[bool]:
+    """NeMo output parser for the hallucination judge: `[safe]` from the last non-empty line. "Answer: No" (or a bare
+    No) = supported, "Answer: Yes" = block, as in every self-check prompt; no verdict there (truncated, prose) blocks.
+    """
+    lines = [line for line in (response or "").splitlines() if line.strip()]
+    m = _VERDICT.match(lines[-1]) if lines else None
+    return [bool(m) and m.group(1).lower() == "no"]
+
+
+PROSE_MIN = 32  # a string leaf this long in a structured result is prose to check; the rest is the tool's data
+_DROP = object()
+
+
+def split_result(result) -> tuple[str, object | None]:
+    """`(statement, data)`: the prose a post rail judges and the tool's own data it must rest on. A text result is all
+    statement with no data; in a structured result the string leaves of PROSE_MIN+ characters are the statement and
+    what remains is the data (a result with no prose is both, e.g. a table of numbers)."""
+    if isinstance(result, str):
+        return result, None
+    prose: list[str] = []
+    rest = _strip(result, prose)
+    if not prose:
+        return canonical(result), result
+    return "\n".join(prose), (None if rest in ({}, [], _DROP) else rest)
+
+
+def _strip(v, prose: list[str]):
+    if isinstance(v, str):
+        if len(v) >= PROSE_MIN:
+            prose.append(v)
+            return _DROP
+        return v
+    if isinstance(v, dict):
+        return {k: s for k, x in v.items() if (s := _strip(x, prose)) is not _DROP}
+    if isinstance(v, list):
+        return [s for x in v if (s := _strip(x, prose)) is not _DROP]
+    return v
+
+
+def evidence(arguments: str, data) -> str:
+    text = f"Tool arguments (as the caller sent them): {arguments}\n"
+    if data is None:
+        return text + "Data computed by the tool: none returned; only the arguments are known."
+    return text + f"Data computed by the tool (JSON): {canonical(data)}"
+
+
+def grounding(evidence_text: str) -> str:
+    """The prompt NeMo's hallucination action samples: restatements of the tool's data, not of the model's knowledge."""
+    return (
+        "A tool answered a call with the data below. Using only this data, state in one or two sentences what it "
+        "shows, quoting the numbers exactly as given.\n" + evidence_text + "\nAnswer:"
+    )
+
+
+EVIDENCE: ContextVar[str] = ContextVar("ramen_evidence", default="")  # read by the `ramen_evidence` prompt variable
 
 
 def topical_prompt(topics: list[str]) -> str:
@@ -322,6 +415,7 @@ def topical_prompt(topics: list[str]) -> str:
 def prompts(tools: Mapping[str, ToolRails], present: set[str]) -> list[dict]:
     """The prompt tasks the named rails need and the repo's `prompts.yml` does not define."""
     need: dict[str, str] = {}
+    extra: dict[str, dict] = {}
     for tool, tr in tools.items():
         for rails in tr.stages.values():
             for name, opts in rails.items():
@@ -333,22 +427,31 @@ def prompts(tools: Mapping[str, ToolRails], present: set[str]) -> list[dict]:
                 elif name in ("self_check_input", "self_check_output"):
                     need[name] = PROMPTS[name]
                 elif name == "hallucination":
+                    task = "self_check_output $variant=hallucination"
+                    need[task] = PROMPTS[task]
+                    extra[task] = {"output_parser": FINAL_ANSWER, "max_tokens": JUDGE_MAX_TOKENS}
+                elif name == "self_consistency":
                     need["self_check_hallucination"] = PROMPTS["self_check_hallucination"]
                 elif name == "fact_checking":
                     need["self_check_facts"] = PROMPTS["self_check_facts"]
-    return [{"task": t, "content": c} for t, c in need.items() if t not in present]
+    return [{"task": t, "content": c} | extra.get(t, {}) for t, c in need.items() if t not in present]
 
 
 def needs_model(tools: Mapping[str, ToolRails]) -> bool:
     return any(RAILS[n].llm for tr in tools.values() for rails in tr.stages.values() for n in rails)
 
 
-def context(tool: str, tr: ToolRails | None, stage: str, prompt: str) -> dict:
-    """The per-call context variables the wrapper flows read."""
+def context(tool: str, tr: ToolRails | None, stage: str, prompt: str, result=None) -> dict:
+    """The per-call context variables the wrapper flows read; `prompt` is the arguments as JSON, `result` what a post
+    rail sees (its prose becomes `ramen_statement`, its data the evidence)."""
     rails = list((tr.stages.get(stage) or {}) if tr else {})
     ctx = {"tool": tool, "ramen_rails": rails, "ramen_prompt": prompt}
     if "topical" in rails:
         ctx["ramen_topical"] = topical_variant(tool)
+    if stage == "post" and rails:
+        statement, data = split_result(result)
+        ev = evidence(prompt, data)
+        ctx |= {"ramen_statement": statement, "ramen_evidence": ev, "ramen_grounding": grounding(ev)}
     return ctx
 
 
@@ -378,6 +481,9 @@ class Engine:
             if self.tools:
                 self._extend(cfg, model)
             self.rails = LLMRails(cfg)
+            if self.tools:  # the post rails' prompts read the tool's own data; the hallucination verdict its last line
+                self.rails.register_prompt_context("ramen_evidence", lambda: EVIDENCE.get(""))
+                self.rails.register_output_parser(final_answer, FINAL_ANSWER)
         except Exception as e:  # noqa: BLE001 - a config problem blocks, never crashes the bridge
             self.error = f"{type(e).__name__}: {self._scrub(str(e))}"
 
@@ -408,6 +514,7 @@ class Engine:
                     getattr(
                         cfg.rails.config.sensitive_data_detection, "input" if stage == "pre" else "output"
                     ).entities = e
+        cfg.lowest_temperature = 0.0  # every judge call is deterministic; only self_consistency samples at 1.0
         if model is not None and needs_model(self.tools):
             cfg.models = [m for m in cfg.models if m.type != "main"] + [
                 Model(type="main", engine=model["engine"], model=model["model"], parameters=dict(model["parameters"]))
@@ -422,7 +529,8 @@ class Engine:
         if stage == "post":
             messages.append({"role": "assistant", "content": canonical(result)})
         which = "input" if stage == "pre" else "output"
-        ctx = context(tool, self.tools.get(tool), stage, args)
+        ctx = context(tool, self.tools.get(tool), stage, args, result)
+        EVIDENCE.set(ctx.get("ramen_evidence", ""))  # this thread's context; NeMo's prompt reads it
         try:
             r = self.rails.generate(
                 messages=[{"role": "context", "content": ctx}, *messages],
@@ -469,10 +577,11 @@ def blocked(stage: str, text: str, rail: str | None, modern: bool) -> dict:
     return out
 
 
-def result_text(result: dict) -> str:
-    """What the output rails judge: `structuredContent` when present, else the text parts joined."""
+def result_payload(result: dict):
+    """What the output rails judge, as the worker's post hook sees it: `structuredContent` when present (its prose
+    the report, the rest the tool's data), else the text parts joined."""
     if isinstance(result.get("structuredContent"), dict | list):
-        return canonical(result["structuredContent"])
+        return result["structuredContent"]
     parts = [c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict) and c.get("type") == "text"]
     return "\n".join(parts)
 
@@ -565,4 +674,4 @@ class Rails:
     def post(self, params: dict, result: dict) -> dict | None:
         if not isinstance(result, dict) or result.get("isError"):
             return None
-        return self._run("post", params, result_text(result))
+        return self._run("post", params, result_payload(result))

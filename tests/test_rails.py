@@ -9,6 +9,7 @@ import os
 import tarfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from test_bridge import fake, run  # noqa: F401 - fixture
@@ -111,12 +112,31 @@ def auth_gr():
     a.close()
 
 
+def judge(text: str) -> str:
+    """The fake's answer to a rendered prompt. The worker's post-rail prompts first (as `ramen/runtime-py/tests/
+    fake_llm.py`): hallucination → a reasoned reply ending "Answer: Yes" (block) when the report says `hallucinated`,
+    else "Answer: No"; self_consistency → the samples are "a sample answer", agreement "no" under the same rule. The
+    self-check prompts: "Yes" (block) when the quoted arguments / result carry the jailbreak phrase or the password."""
+    report = text.split('Report to check: "', 1)[-1]
+    if "does the report state anything that is not supported by the data?" in text.lower():
+        bad = "hallucinated" in report
+        return f'1. "the report" ({"unsupported" if bad else "supported"})\n\nAnswer: {"Yes" if bad else "No"}'
+    if '"agreement":' in text:
+        return "no" if "hallucinated" in report else "yes"
+    if "state in one or two sentences what it shows" in text:
+        return "a sample answer"
+    for marker in ('Tool arguments: "', 'Tool result: "'):
+        if marker in text:
+            text = text.split(marker, 1)[1]
+    return "Yes" if ("ignore previous instructions" in text or "hunter2" in text) else "No"
+
+
 class FakeLLM:
-    """An OpenAI-compatible `/chat/completions` that judges deterministically: "Yes" (block) when the quoted tool
-    arguments / result carry the jailbreak phrase or the leaked password, else "No"."""
+    """An OpenAI-compatible `/chat/completions` that judges deterministically (`judge`)."""
 
     def __init__(self):
         self.requests: list[dict] = []
+        self.answers: list[str] = []
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -124,10 +144,8 @@ class FakeLLM:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 outer.requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
                 text = " ".join(m.get("content", "") for m in body.get("messages", []) if isinstance(m, dict))
-                for marker in ('Tool arguments: "', 'Tool result: "'):
-                    if marker in text:
-                        text = text.split(marker, 1)[1]
-                ans = "Yes" if ("ignore previous instructions" in text or "hunter2" in text) else "No"
+                ans = judge(text)
+                outer.answers.append(ans)
                 out = {
                     "id": "x",
                     "object": "chat.completion",
@@ -467,12 +485,98 @@ def test_pack_parsing_prompts_and_the_model_mapping(home):  # noqa: F811
     assert "no model" in rails.model_of({"provider": "openai"})[1]
     assert rails.model_of(None) == (None, rails.NO_LLM)
     assert (
-        rails.result_text(
+        rails.result_payload(
             {"content": [{"type": "text", "text": "a"}, {"type": "image"}, {"type": "text", "text": "b"}]}
         )
         == "a\nb"
     )
-    assert rails.result_text({"structuredContent": {"k": 1}, "content": []}) == '{"k":1}'
+    assert rails.result_payload({"structuredContent": {"k": 1}, "content": []}) == {"k": 1}
+
+
+JUDGE = json.loads((Path(__file__).parent / "fixtures" / "judge_answers.json").read_text())  # the runtime's recording
+HALLUCINATION_Q = "Does the report state anything that is not supported by the data?\nFirst check each sentence"
+
+
+@pytest.mark.parametrize(
+    ("answer", "safe"),
+    [
+        (JUDGE["good"], True),  # real gpt-4o-mini, a correct iris_report: 9 lines "(supported)" then "Answer: No"
+        (JUDGE["bad"], False),  # one mean changed in the prose: line 8 "(unsupported)", "Answer: Yes"
+        (JUDGE["old_prompt_correct_report"], False),  # a bare Yes still means "found something"
+        ("No", True),  # a bare verdict
+        ("**Answer: No.**", True),
+        ("Verdict: no", True),
+        ("answer: yes", False),
+        (JUDGE["good"].rsplit("\n", 2)[0], False),  # truncated before the verdict: fail closed
+        ("Nothing is unsupported.", False),  # no verdict line: fail closed, never a substring match on "no"
+        ("Answer: Not sure", False),
+        ("", False),
+        (None, False),
+    ],
+    ids=[
+        "real-good",
+        "real-bad",
+        "real-old",
+        "bare-no",
+        "bold",
+        "verdict",
+        "lower-yes",
+        "truncated",
+        "prose",
+        "unsure",
+        "empty",
+        "none",
+    ],
+)
+def test_the_hallucination_verdict_is_the_final_answer_line(answer, safe):
+    """As the worker's `guardrails_llm.final_answer`: NeMo's `is_content_safe` reads the first two words, so a reasoned
+    reply ("1. The …") would parse as unsafe; the verdict is the last non-empty line."""
+    assert rails.final_answer(answer) == [safe]
+
+
+def test_post_rails_judge_the_prose_against_the_tools_own_data():
+    # the worker's prompt and task settings: one grounded judge, parsed on its final line, room for every sentence
+    p = rails.PROMPTS["self_check_output $variant=hallucination"]
+    assert HALLUCINATION_Q in p and '"Answer: Yes" if any sentence is unsupported' in p and "{{ ramen_evidence }}" in p
+    assert p.rstrip().endswith('"Answer: No" if every sentence is supported.')
+    tools = {
+        "x": rails.ToolRails({"post": {"hallucination": {}, "self_consistency": {}, "fact_checking": {}}}),
+    }
+    tasks = {t["task"]: t for t in rails.prompts(tools, set())}
+    assert sorted(tasks) == ["self_check_facts", "self_check_hallucination", "self_check_output $variant=hallucination"]
+    hal = tasks["self_check_output $variant=hallucination"]
+    assert hal["output_parser"] == rails.FINAL_ANSWER == "ramen_final_answer" and hal["max_tokens"] == 2048
+    assert (
+        "output_parser" not in tasks["self_check_hallucination"]
+        and "{{ ramen_evidence }}" in tasks["self_check_hallucination"]["content"]
+    )
+    text, flows = rails.colang(tools)
+    assert flows["output"] == ["ramen rail hallucination", "ramen rail self_consistency", "ramen rail fact_checking"]
+    assert 'self_check_output(variant="hallucination", bot_message=$ramen_statement)' in text
+    assert "last_bot_prompt=$ramen_grounding" in text and "relevant_chunks=$ramen_evidence" in text
+    assert "the result did not pass the self-consistency check" in text
+    # the result split: long string leaves are the report, the rest is the tool's data; text is all report
+    data = {"text": "The mean sepal width is 3.06 cm over 150 rows.", "stats": {"mean": 3.06, "rows": 150}}
+    assert rails.split_result(data) == (data["text"], {"stats": {"mean": 3.06, "rows": 150}})
+    assert rails.split_result([data["text"]]) == (data["text"], None)
+    assert rails.split_result({"rows": [1, 2], "k": "short"}) == (
+        '{"k":"short","rows":[1,2]}',
+        {"rows": [1, 2], "k": "short"},
+    )
+    assert rails.split_result("plain text") == ("plain text", None)
+    ctx = rails.context("x", tools["x"], "post", '{"q":"iris"}', data)
+    assert ctx["ramen_statement"] == data["text"]
+    assert ctx["ramen_evidence"] == (
+        'Tool arguments (as the caller sent them): {"q":"iris"}\n'
+        'Data computed by the tool (JSON): {"stats":{"mean":3.06,"rows":150}}'
+    )
+    assert ctx["ramen_grounding"].startswith("A tool answered a call with the data below.")
+    assert ctx["ramen_grounding"].endswith(ctx["ramen_evidence"] + "\nAnswer:")
+    assert (
+        "none returned; only the arguments are known"
+        in rails.context("x", tools["x"], "post", "{}", "t")["ramen_evidence"]
+    )
+    assert "ramen_statement" not in rails.context("x", rails.ToolRails({"pre": {"self_check_input": {}}}), "post", "{}")
 
 
 def signed_in(fake, auth_gr, llm_url):  # noqa: F811
@@ -661,3 +765,61 @@ def test_without_the_nemo_extra_the_bridge_warns_once(home, fake, auth_gr, monke
     b.rails.announce()
     assert json.loads(run(b, call(3, jail)))["result"] == OK3
     assert rails.NO_EXTRA not in capsys.readouterr().err
+
+
+REPORT_YAML = """engine: nemo
+config: mcp/guardrails
+tools:
+  report: {post: [hallucination]}
+  consist: {post: [self_consistency]}
+"""
+GOOD = "The mean sepal width is 3.06 cm over 150 rows of data."
+
+
+@nemo
+def test_local_hallucination_and_self_consistency_judge_the_report_against_the_data(home, fake, auth_gr, llm):  # noqa: F811
+    GrFake(fake)
+    _, b = signed_in(fake, auth_gr, llm.url)
+    auth_gr.guardrails = {**guardrails_obj(llm.url), "config": pack({**PACK_FILES, "guardrails.yaml": REPORT_YAML})}
+    b.bearer(force=True)
+
+    def structured(text):
+        sc = {"text": text, "stats": {"mean": 3.06, "rows": 150}}
+        return {"content": [{"type": "text", "text": json.dumps(sc)}], "structuredContent": sc, "isError": False}
+
+    fake.tool_results["report"] = structured(GOOD)
+    out = json.loads(run(b, call(1, {"q": "iris"}, name="report")))
+    assert out["result"] == structured(GOOD)
+    assert len(llm.requests) == 1, "one grounded judge call, no sampling"
+    body = llm.requests[-1]["body"]
+    assert body["temperature"] == 0 and body["max_tokens"] == 2048
+    t = body["messages"][-1]["content"]
+    head, report = t.split("Report to check:", 1)
+    assert "tool's OWN computed data" in head and '"stats":{"mean":3.06,"rows":150}' in head and '{"q":"iris"}' in head
+    assert GOOD not in head and GOOD in report and HALLUCINATION_Q in report
+    assert llm.answers[-1].endswith("Answer: No") and "\n" in llm.answers[-1], "a reasoned reply, parsed on its end"
+    fake.tool_results["report"] = structured("A hallucinated mean of 9.99 cm over 150 rows of data.")
+    res = json.loads(run(b, call(2, {"q": "iris"}, name="report")))["result"]
+    assert res["isError"] and res["content"][0]["text"] == (
+        "guardrail blocked: post: the result did not pass the hallucination check"
+    )
+    assert res["_meta"]["ramen"]["guardrail"] == {
+        "stage": "post", "engine": "nemo", "rail": "hallucination", "where": "client"
+    }  # fmt: skip
+    # a text result: judged against the arguments alone
+    fake.tool_results["report"] = {"content": [{"type": "text", "text": "fine"}], "isError": False}
+    assert not json.loads(run(b, call(3, {"q": "iris"}, name="report")))["result"]["isError"]
+    assert "none returned; only the arguments are known" in llm.requests[-1]["body"]["messages"][-1]["content"]
+    # self_consistency: NeMo samples restatements of the tool's data, then one agreement judge
+    llm.requests.clear()
+    fake.tool_results["consist"] = structured(GOOD)
+    assert not json.loads(run(b, call(4, {"q": "iris"}, name="consist")))["result"]["isError"]
+    texts = [r["body"]["messages"][-1]["content"] for r in llm.requests]
+    assert (
+        len(texts) >= 2
+        and all("state in one or two sentences" in x for x in texts[:-1])
+        and '"agreement":' in texts[-1]
+    )
+    fake.tool_results["consist"] = structured("A hallucinated mean of 9.99 cm over 150 rows of data.")
+    res = json.loads(run(b, call(5, {"q": "iris"}, name="consist")))["result"]
+    assert res["isError"] and res["_meta"]["ramen"]["guardrail"]["rail"] == "self_consistency"

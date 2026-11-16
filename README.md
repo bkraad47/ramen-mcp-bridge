@@ -233,11 +233,14 @@ the worker gate holds for every caller; the bridge:
 - **runs the same rails locally** when installed with the extra — `uv tool install 'ramen-mcp-bridge[nemo]'` (or
   `uvx 'ramen-mcp-bridge[nemo]@latest' …`; NeMo Guardrails 0.24 wants Python 3.10–3.13, so add `--python 3.12` on a
   newer interpreter). Before a `tools/call` leaves, the tool's **input** rails run over the JSON arguments; when the
-  result comes back, its **output** rails run over the result text (`structuredContent` when present). The rails are
+  result comes back, its **output** rails run over the result (`structuredContent` when present: its long string
+  fields are the report, the rest plus the call's arguments the evidence it is judged against). The rails are
   the worker's: the pack's own Colang flows, plus the LLM rails the yaml names per tool (`pre: [self_check_input,
   jailbreak_detection, {topical: {topics: [...]}}, sensitive_data]`, `post: [self_check_output, hallucination,
-  fact_checking, sensitive_data]`), built exactly as the worker builds them (wrapper flows `ramen rail <name>`, the same
-  prompts unless the pack's `prompts.yml` defines the task) with `models:` filled from `client_llm` through NeMo's
+  self_consistency, fact_checking, sensitive_data]`), built exactly as the worker builds them (wrapper flows
+  `ramen rail <name>`, the same prompts unless the pack's `prompts.yml` defines the task, every judge at temperature 0;
+  `hallucination` is one grounded judge checking each sentence and parsed on its final `Answer: Yes|No` line, anything
+  else blocks; `self_consistency` is NeMo's sampling check) with `models:` filled from `client_llm` through NeMo's
   OpenAI-compatible client (`openai`, `openai_compatible` + `base_url`, `azure` + `endpoint` + `deployment`,
   `anthropic`, `vertex` and `bedrock` with an API key; `vertex` / `bedrock` without one need a cloud login the bridge
   does not hold, so those LLM rails stay on the worker — one note on stderr). A block is answered to the host the way
