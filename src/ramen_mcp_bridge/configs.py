@@ -32,7 +32,7 @@ from pathlib import Path
 import tomli_w
 import yaml
 
-from .policy import Policy, home, host_of, say
+from .policy import Policy, home, host_of, newline_of, say
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -311,8 +311,8 @@ def read_text(path: Path) -> str | None:
 def write_text(path: Path, text: str, private: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    with os.fdopen(os.open(tmp, flags, 0o600 if private else 0o644), "w", encoding="utf-8") as f:
+    flags, nl = os.O_WRONLY | os.O_CREAT | os.O_TRUNC, newline_of(path)
+    with os.fdopen(os.open(tmp, flags, 0o600 if private else 0o644), "w", encoding="utf-8", newline=nl) as f:
         f.write(text)
     os.replace(tmp, path)
     if private:

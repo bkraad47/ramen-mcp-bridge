@@ -66,6 +66,15 @@ def baseline_path(target: str, group: str) -> Path:
     return home() / ".ramen" / "skillspector" / host_of(target) / group / "baseline.yaml"
 
 
+def newline_of(path: Path) -> str:
+    """The line ending a file already uses, so a rewrite keeps it (and `remove` restores its bytes) on every OS — not
+    the OS's own (Windows' text mode writes CRLF into an LF file); LF for a new file."""
+    try:
+        return "\r\n" if b"\r\n" in path.read_bytes() else "\n"
+    except OSError:
+        return "\n"
+
+
 def write_private(path: Path, data: str | bytes) -> None:
     """0600 file under 0700 directories, replaced atomically; text goes out as UTF-8 with its own line endings, the
     same bytes on every OS (Windows' text mode would write the locale code page and CRLF)."""

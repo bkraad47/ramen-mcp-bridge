@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-from .policy import Policy, home, host_of, say, write_private
+from .policy import Policy, home, host_of, newline_of, say, write_private
 
 MARK = "_ramen"
 IDENT = ("target", "group", "zone")
@@ -84,7 +84,7 @@ def _read_json(path: Path) -> dict | None:
 def _write_json(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8", newline=newline_of(path))
     os.replace(tmp, path)
 
 
@@ -242,7 +242,7 @@ def install(pol: Policy, bridge_args: list[str], client_scan: bool = True) -> li
         path = Path(name)
         if not path.exists() or path.read_text(encoding="utf-8") != text:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
+            path.write_text(text, encoding="utf-8", newline=newline_of(path))
         done.append({"kind": "cursor", "file": str(path), "key": "", **ident})
 
     code = vscode_user_dir()
@@ -291,7 +291,7 @@ def _put_back(path: Path, settings: dict, entry: dict) -> None:
         except OSError:
             pass
     elif isinstance(snapshot, str) and _read_json_text(snapshot) in (settings, pruned):
-        path.write_text(snapshot, encoding="utf-8")
+        path.write_text(snapshot, encoding="utf-8", newline=newline_of(path))
     else:
         _write_json(path, settings)
 

@@ -330,18 +330,23 @@ def test_apply_every_format_and_merge_idempotently_then_restore(home, capsys):  
     assert (home / ".claude" / "CLAUDE.md").read_text() == "# Mine\n\nkeep me\n\nlater\n"
 
 
-def test_text_is_utf8_whatever_the_locale_and_remove_restores_the_bytes(home):  # noqa: F811
-    """Windows' text mode reads and writes the locale code page (cp1252), which cannot hold `→` or `🍜` and misreads
-    UTF-8: client files are UTF-8 on every OS."""
+@pytest.mark.parametrize("nl", ["\n", "\r\n"])
+def test_text_is_utf8_in_the_files_own_line_endings_and_remove_restores_the_bytes(home, nl):  # noqa: F811
+    """Windows' text mode would read and write the locale code page (cp1252, which cannot hold `→` or `🍜` and
+    misreads UTF-8) and turn an LF file into CRLF: client files are UTF-8 and keep their line endings on every OS."""
     (home / ".claude").mkdir()
     md = home / ".claude" / "CLAUDE.md"
-    mine = "# Mine — Á ünïcode 🍜\n".encode()
+    mine = f"# Mine — Á ünïcode 🍜{nl}{nl}keep me{nl}".encode()
     md.write_bytes(mine)
     pol = policy.Policy(TARGET, "demo", "a", "https://c")
     pol.update(None, None, None, {**CF, "files": {**FILES, "CLAUDE.md": "Use the → ${RAMEN_GROUP} tools 🍜\n"}})
     configs.apply(pol)
-    text = md.read_bytes().decode("utf-8")
-    assert text.startswith(mine.decode()) and "Use the → demo tools 🍜" in text
+    raw = md.read_bytes()
+    assert raw.startswith(mine) and f"Use the → demo tools 🍜{nl}".encode() in raw
+    assert raw.count(b"\n") == raw.count(nl.encode())  # one line ending throughout
+    assert (
+        home / "notes.txt"
+    ).read_bytes() == b"# ramen:ramen.example.com/demo\nline from ramen\n# /ramen\n"  # new: LF
     assert configs.verify(pol) == []
     clients.remove(TARGET, "demo", "a")
     assert md.read_bytes() == mine
