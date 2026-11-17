@@ -1,6 +1,6 @@
 [project]
 name = "ramen-mcp-bridge"
-version = "0.3.0"
+version = "1.0.0"
 description = "Stdio MCP bridge for Project Ramen: forwards JSON-RPC to a ramen.v1.Mcp/Call worker over gRPC"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -9,7 +9,15 @@ dependencies = [
     "grpcio>=1.76",
     "grpcio-health-checking>=1.76",
     "protobuf>=5",
+    "pyyaml>=6",
+    "tomli-w>=1",
+    "tomli>=2; python_version < '3.11'",
 ]
+
+[project.optional-dependencies]
+# §36.3: the group's NeMo rails run locally too (`policy rails on|off`); the same pin as ramen-runtime's `nemo` extra.
+# NeMo 0.24 wants Python 3.10–3.13: `uv run --python 3.12 --extra nemo …` on a newer interpreter.
+nemo = ["nemoguardrails>=0.24,<0.25; python_version < '3.14'"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.16", "grpcio-tools>=1.76", "mcp>=2,<3"]
