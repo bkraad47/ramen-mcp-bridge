@@ -338,6 +338,9 @@ def test_text_is_utf8_in_the_files_own_line_endings_and_remove_restores_the_byte
     md = home / ".claude" / "CLAUDE.md"
     mine = f"# Mine — Á ünïcode 🍜{nl}{nl}keep me{nl}".encode()
     md.write_bytes(mine)
+    js = home / ".claude" / "settings.json"
+    theirs = f'{{{nl}  "theme": "dark"{nl}}}{nl}'.encode()
+    js.write_bytes(theirs)
     pol = policy.Policy(TARGET, "demo", "a", "https://c")
     pol.update(None, None, None, {**CF, "files": {**FILES, "CLAUDE.md": "Use the → ${RAMEN_GROUP} tools 🍜\n"}})
     configs.apply(pol)
@@ -348,8 +351,10 @@ def test_text_is_utf8_in_the_files_own_line_endings_and_remove_restores_the_byte
         home / "notes.txt"
     ).read_bytes() == b"# ramen:ramen.example.com/demo\nline from ramen\n# /ramen\n"  # new: LF
     assert configs.verify(pol) == []
+    # the user re-saves the JSON on one line: once Ramen's keys go, the pre-ramen bytes come back, endings and all
+    js.write_bytes(json.dumps(json.loads(js.read_bytes())).encode())
     clients.remove(TARGET, "demo", "a")
-    assert md.read_bytes() == mine
+    assert md.read_bytes() == mine and js.read_bytes() == theirs
 
 
 def test_targets_that_cannot_be_written_are_skipped_with_a_note(home, capsys):  # noqa: F811

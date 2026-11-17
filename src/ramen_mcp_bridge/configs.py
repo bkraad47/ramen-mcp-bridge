@@ -32,7 +32,7 @@ from pathlib import Path
 import tomli_w
 import yaml
 
-from .policy import Policy, home, host_of, newline_of, say
+from .policy import Policy, home, host_of, newline_for, say
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -301,9 +301,11 @@ class Target:
         return None if ok.get(self.merge) else f"merge {self.merge!r} does not fit format {self.fmt!r}"
 
 
-def read_text(path: Path) -> str | None:
+def read_text(path: Path, raw: bool = False) -> str | None:
+    """UTF-8 whatever the locale; `raw` keeps CRLF (a snapshot that restores the bytes), else newlines are `\\n`."""
     try:
-        return path.read_text(encoding="utf-8")
+        with open(path, encoding="utf-8", newline="" if raw else None) as f:
+            return f.read()
     except OSError:
         return None
 
@@ -311,7 +313,7 @@ def read_text(path: Path) -> str | None:
 def write_text(path: Path, text: str, private: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    flags, nl = os.O_WRONLY | os.O_CREAT | os.O_TRUNC, newline_of(path)
+    flags, nl = os.O_WRONLY | os.O_CREAT | os.O_TRUNC, newline_for(path, text)
     with os.fdopen(os.open(tmp, flags, 0o600 if private else 0o644), "w", encoding="utf-8", newline=nl) as f:
         f.write(text)
     os.replace(tmp, path)
@@ -355,7 +357,7 @@ def keep(entry: dict, key: str, value, token: str) -> None:
 
 def apply_target(t: Target, ctx: Ctx, before: dict | None, ident: dict, version: str) -> dict | None:
     """Write one target (first time or again); the ledger entry, or None when the file cannot be rewritten."""
-    cur = read_text(t.path)
+    cur, raw = read_text(t.path), read_text(t.path, raw=True)
     existed = cur is not None
     entry = {
         "kind": KIND,
@@ -373,7 +375,7 @@ def apply_target(t: Target, ctx: Ctx, before: dict | None, ident: dict, version:
     token = ctx.token
     if t.merge == "replace":
         entry.setdefault("existed", existed)
-        keep(entry, "snapshot", cur, token)
+        keep(entry, "snapshot", raw, token)
         entry["owned"], entry["hash"] = [], sha(t.text)
         if cur != t.text:
             write_text(t.path, t.text, private)
@@ -410,7 +412,7 @@ def apply_target(t: Target, ctx: Ctx, before: dict | None, ident: dict, version:
     pairs = leaves(frag)
     hooks = {json.dumps(p): [hook_key(e) for e in v] for p, v in pairs if is_hook_list(p, v)}
     entry.setdefault("existed", existed)
-    keep(entry, "snapshot", cur, token)
+    keep(entry, "snapshot", raw, token)
     prior = {}
     for p, _ in pairs:
         v = owned_value(obj, p, hooks)

@@ -66,9 +66,12 @@ def baseline_path(target: str, group: str) -> Path:
     return home() / ".ramen" / "skillspector" / host_of(target) / group / "baseline.yaml"
 
 
-def newline_of(path: Path) -> str:
-    """The line ending a file already uses, so a rewrite keeps it (and `remove` restores its bytes) on every OS — not
-    the OS's own (Windows' text mode writes CRLF into an LF file); LF for a new file."""
+def newline_for(path: Path, text: str) -> str:
+    """The `newline=` that writes `text` to `path` in the right line endings on every OS — not the OS's own (Windows'
+    text mode turns an LF file into CRLF): text that carries CRLF (a raw pre-ramen snapshot) as it is, else the ending
+    the file already uses; LF for a new file. So a rewrite keeps the file's endings and `remove` restores its bytes."""
+    if "\r\n" in text:
+        return ""
     try:
         return "\r\n" if b"\r\n" in path.read_bytes() else "\n"
     except OSError:
